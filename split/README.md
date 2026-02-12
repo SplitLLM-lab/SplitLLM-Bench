@@ -15,11 +15,10 @@ Three layers only:
 3. Write `front/back` safetensors + configs + `split_plan.json`
 
 ## Usage
-
 Use local checkpoint:
 
 ```bash
-python -m split.split_ckpt \
+python -m split.ckpt \
   --local_repo /path/to/model_repo \
   --cut 12 \
   --out_dir split_out
@@ -28,7 +27,7 @@ python -m split.split_ckpt \
 Download from HuggingFace:
 
 ```bash
-python -m split.split_ckpt \
+python -m split.ckpt \
   --model_id Qwen/Qwen3-1.7B \
   --cut 12 \
   --out_dir split_out
@@ -43,7 +42,7 @@ Outputs:
 
 ## Add New Model (Minimal Change)
 
-If a new model uses different key names, update adapter rules in `split/split_ckpt.py`:
+If a new model uses different key names, update adapter rules in `split/ckpt.py`:
 - add a new `SplitAdapter`
 - set `embed_prefixes`
 - set `back_prefixes`
@@ -53,4 +52,3 @@ If a new model uses different key names, update adapter rules in `split/split_ck
   - `suffix`
 
 Usually you only need to add a small regex and one mapping entry.
-
