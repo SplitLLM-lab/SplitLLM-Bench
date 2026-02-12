@@ -13,6 +13,7 @@ docs/my_docs/
 split_out/
 ckpt_snap/
 bench/results/
+viz_out/
 AGENTS.md
 test.py
 
