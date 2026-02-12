@@ -6,12 +6,8 @@ from typing import Any, Optional, Sequence
 import torch
 from transformers import AutoTokenizer
 
-from .runtime import (
-    LocalSplitRuntime,
-    RemoteSplitRuntime,
-    RuntimeGenerateResult,
-    SamplingConfig,
-)
+from .codec import ActivationCodec
+from .runtime import LocalSplitRuntime, RemoteSplitRuntime, RuntimeGenerateResult, SamplingConfig
 
 
 @dataclass
@@ -88,6 +84,7 @@ class SplitLLMModel:
         dtype: str = "auto",
         timeout_sec: float = 120.0,
         revision: str | None = None,
+        codec: ActivationCodec | None = None,
     ) -> "SplitLLMModel":
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, use_fast=True)
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
@@ -102,6 +99,7 @@ class SplitLLMModel:
                 device=device,
                 dtype=dtype,
                 revision=revision,
+                codec=codec,
             )
         elif mode == "remote_back":
             if not front_dir or not server_url:
@@ -113,6 +111,7 @@ class SplitLLMModel:
                 dtype=dtype,
                 timeout_sec=timeout_sec,
                 revision=revision,
+                codec=codec,
             )
         else:
             raise ValueError(
@@ -149,6 +148,7 @@ class SplitLLMModel:
         bad_words: Optional[Sequence[str]] = None,
         bad_words_ids: Optional[list[list[int]]] = None,
         stop_token_ids: Optional[Sequence[int]] = None,
+        codec_extras: Optional[dict[str, Any]] = None,
         use_chat_template: bool = True,
         add_generation_prompt: bool = True,
         skip_special_tokens: bool = True,
@@ -202,6 +202,7 @@ class SplitLLMModel:
             eos_token_id=eos_token_id,
             stop_token_ids=used_stop_ids,
             sampling=sampling,
+            codec_extras=codec_extras,
         )
 
         generated = runtime_result.generated_token_ids
