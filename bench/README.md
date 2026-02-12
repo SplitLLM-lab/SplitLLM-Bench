@@ -14,6 +14,12 @@ Codec argument:
   - `--codec custom.my_codec:build_codec` (explicit attribute)
   - `--codec custom.registry.my_codec` (module.attribute)
 
+Runtime argument:
+- `ppl.py` is local-only (`front_dir` + `back_dir`)
+- `latency.py` supports both:
+  - Local split: `--runtime_mode local_split --front_dir ... --back_dir ...`
+  - Remote back: `--runtime_mode remote_back --front_dir ... --server_url http://127.0.0.1:8000`
+
 ## Design Notes
 
 To keep experiments comparable across codec/bench/mode, each benchmark should:
@@ -89,6 +95,20 @@ python3 -m bench.latency \
   --max_new_tokens 64 \
   --codec custom.my_codec \
   --out_json bench/results/latency_local_default.json
+```
+
+Remote back example:
+
+```bash
+python3 -m bench.latency \
+  --runtime_mode remote_back \
+  --front_dir ./split_out/front \
+  --server_url http://127.0.0.1:8000 \
+  --timeout_sec 120 \
+  --max_prompt_length 256 \
+  --max_new_tokens 64 \
+  --codec default \
+  --out_json bench/results/latency_remote_default.json
 ```
 
 Main output metrics:

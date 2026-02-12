@@ -17,8 +17,7 @@ Features:
 Example:
 
 ```bash
-source /home/nwlab/b2gan/.venv/bin/activate && \
-/home/nwlab/b2gan/.venv/bin/python -m viz.activation \
+python -m viz.activation \
   --front_dir ./split_out/front \
   --tokenizer_id /path/to/local/tokenizer \
   --local_files_only \

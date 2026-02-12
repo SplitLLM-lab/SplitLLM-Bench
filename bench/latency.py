@@ -13,7 +13,7 @@ import torch
 from transformers import AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
-from model import CodecContext, LocalSplitRuntime, SamplingConfig
+from model import CodecContext, LocalSplitRuntime, RemoteSplitRuntime, SamplingConfig
 from model.codec import ActivationCodec, EncodedActivation
 from model.runtime import (
     build_logits_processors,
@@ -23,6 +23,9 @@ from model.runtime import (
 )
 
 from bench.utils import build_codec, load_texts, parse_codec_extras
+
+
+RuntimeType = LocalSplitRuntime | RemoteSplitRuntime
 
 
 @dataclass
@@ -51,8 +54,16 @@ def parse_args() -> argparse.Namespace:
             "(TTFT, system latency, codec encode/decode latency, transfer bytes)."
         ),
     )
+    p.add_argument(
+        "--runtime_mode",
+        type=str,
+        default="local_split",
+        choices=["local_split", "remote_back"],
+    )
     p.add_argument("--front_dir", type=str, default="./split_out/front")
     p.add_argument("--back_dir", type=str, default="./split_out/back")
+    p.add_argument("--server_url", type=str, default=None)
+    p.add_argument("--timeout_sec", type=float, default=120.0)
     p.add_argument("--revision", type=str, default=None)
     p.add_argument("--tokenizer_id", type=str, default="Qwen/Qwen3-1.7B")
     p.add_argument("--trust_remote_code", action="store_true")
@@ -95,6 +106,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_json", type=str, default=None)
     return p.parse_args()
+
+
+def build_runtime(args: argparse.Namespace, codec: ActivationCodec) -> RuntimeType:
+    if args.runtime_mode == "local_split":
+        return LocalSplitRuntime(
+            front_dir=args.front_dir,
+            back_dir=args.back_dir,
+            device=args.device,
+            dtype=args.dtype,
+            revision=args.revision,
+            codec=codec,
+        )
+    if not args.server_url:
+        raise ValueError("remote_back mode requires --server_url")
+    return RemoteSplitRuntime(
+        front_dir=args.front_dir,
+        server_url=args.server_url,
+        device=args.device,
+        dtype=args.dtype,
+        timeout_sec=float(args.timeout_sec),
+        revision=args.revision,
+        codec=codec,
+    )
 
 
 def mean(xs: list[float]) -> float:
@@ -353,6 +387,39 @@ def run_one_sample(
     )
 
 
+@torch.no_grad()
+def run_one_sample_remote(
+    *,
+    runtime: RemoteSplitRuntime,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    eos_token_id: int | None,
+    stop_token_ids: set[int],
+    sampling: SamplingConfig,
+    max_new_tokens: int,
+    codec_extras: dict[str, Any],
+) -> SampleMetric:
+    prompt_len = int(input_ids.shape[1])
+    result = runtime.generate_from_ids(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=eos_token_id,
+        stop_token_ids=stop_token_ids,
+        sampling=sampling,
+        codec_extras=codec_extras,
+    )
+    return SampleMetric(
+        ttft_ms=float(result.ttft_ms),
+        total_ms=float(result.total_ms),
+        prompt_tokens=prompt_len,
+        generated_tokens=len(result.generated_token_ids),
+        finish_reason=result.finish_reason,
+        decode_step_ms=[float(x) for x in result.per_token_rtt_ms],
+        codec_rounds=[],
+    )
+
+
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
@@ -361,15 +428,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     codec_extras = parse_codec_extras(args.codec_extras_json)
     codec = build_codec(args.codec)
 
-    runtime = LocalSplitRuntime(
-        front_dir=args.front_dir,
-        back_dir=args.back_dir,
-        device=args.device,
-        dtype=args.dtype,
-        revision=args.revision,
-        codec=codec,
-    )
+    runtime = build_runtime(args, codec)
     codec = runtime.codec
+    mode = str(args.runtime_mode)
+    is_remote = isinstance(runtime, RemoteSplitRuntime)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_id,
@@ -418,8 +480,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         torch.bfloat16,
     )
 
-    print(f"[info] benchmark=latency mode=local_split codec={codec.name}")
+    print(f"[info] benchmark=latency mode={mode} codec={codec.name}")
     print(f"[info] device={runtime.device}, dtype={runtime.dtype}, autocast={amp_enabled}")
+    if is_remote:
+        print(
+            f"[info] remote server={args.server_url}, timeout_sec={float(args.timeout_sec):.1f}"
+        )
+        print(
+            "[warn] codec roundtrip metrics are local-only; remote_back codec fields report 0"
+        )
     print(f"[info] loaded {n} samples from {args.dataset_name}/{args.dataset_config}:{args.split}")
     print(f"[info] max_prompt_length={args.max_prompt_length}, max_new_tokens={args.max_new_tokens}")
 
@@ -452,18 +521,30 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             runtime.device
         )
 
-        metric = run_one_sample(
-            runtime=runtime,
-            codec=codec,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            eos_token_id=eos_token_id,
-            stop_token_ids=stop_token_ids,
-            sampling=sampling,
-            max_new_tokens=int(args.max_new_tokens),
-            codec_extras=codec_extras,
-            amp_enabled=amp_enabled,
-        )
+        if is_remote:
+            metric = run_one_sample_remote(
+                runtime=runtime,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                eos_token_id=eos_token_id,
+                stop_token_ids=stop_token_ids,
+                sampling=sampling,
+                max_new_tokens=int(args.max_new_tokens),
+                codec_extras=codec_extras,
+            )
+        else:
+            metric = run_one_sample(
+                runtime=runtime,
+                codec=codec,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                eos_token_id=eos_token_id,
+                stop_token_ids=stop_token_ids,
+                sampling=sampling,
+                max_new_tokens=int(args.max_new_tokens),
+                codec_extras=codec_extras,
+                amp_enabled=amp_enabled,
+            )
 
         ttft_ms_all.append(metric.ttft_ms)
         total_ms_all.append(metric.total_ms)
@@ -511,11 +592,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "benchmark": {
             "name": "latency",
-            "mode": "local_split",
+            "mode": mode,
         },
         "model": {
             "front_dir": str(Path(args.front_dir).expanduser()),
-            "back_dir": str(Path(args.back_dir).expanduser()),
+            "back_dir": str(Path(args.back_dir).expanduser()) if not is_remote else None,
+            "server_url": args.server_url if is_remote else None,
             "tokenizer_id": args.tokenizer_id,
             "revision": args.revision,
         },
@@ -534,6 +616,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "dtype": str(runtime.dtype),
             "seed": int(args.seed),
             "autocast": bool(amp_enabled),
+            "timeout_sec": float(args.timeout_sec) if is_remote else None,
         },
         "eval": {
             "samples": int(n),
