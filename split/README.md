@@ -1,20 +1,19 @@
-# Split Tools
+# Split
 
-Minimal split tool for edge-cloud collaborative inference.
+Checkpoint splitting tools for edge-cloud inference experiments.
 
-Current target models:
-- Qwen
-- Llama3 / Llama3.2
-- Gemma
+## Purpose
 
-## Design
+- split model checkpoints into `front` and `back`
+- remap back-layer indices after the cut
+- save reproducible split artifacts and split plans
 
-Three layers only:
-1. Read shards / list keys / load tensors
-2. Route each key to `front` or `back`, and remap back layer index
-3. Write `front/back` safetensors + configs + `split_plan.json`
+## Files
+
+- `split/ckpt.py`: split CLI and model-specific adapter rules
 
 ## Usage
+
 Use local checkpoint:
 
 ```bash
@@ -33,22 +32,8 @@ python -m split.ckpt \
   --out_dir split_out
 ```
 
-Outputs:
-- `split_out/front/model.safetensors`
-- `split_out/back/model.safetensors`
-- `split_out/front/config.json`
-- `split_out/back/config.json`
-- `split_out/split_plan.json`
+## Notes
 
-## Add New Model (Minimal Change)
-
-If a new model uses different key names, update adapter rules in `split/ckpt.py`:
-- add a new `SplitAdapter`
-- set `embed_prefixes`
-- set `back_prefixes`
-- add `layer_patterns` with named groups:
-  - `prefix`
-  - `idx`
-  - `suffix`
-
-Usually you only need to add a small regex and one mapping entry.
+- Current adapters target Qwen, Llama3/Llama3.2, and Gemma.
+- Output files: `split_out/front/model.safetensors`, `split_out/back/model.safetensors`, `split_out/front/config.json`, `split_out/back/config.json`, `split_out/split_plan.json`.
+- To add a new model family, extend `SplitAdapter` rules in `split/ckpt.py` and set `embed_prefixes`, `back_prefixes`, and `layer_patterns` named groups (`prefix`, `idx`, `suffix`).

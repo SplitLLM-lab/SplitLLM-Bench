@@ -1,22 +1,28 @@
 # SplitLLM
-SplitLLM is a research-oriented codebase for split LLM inference experiments.
 
-## Scope
+Research codebase for split LLM edge-cloud inference experiments.
 
-This repository is mainly for:
-- checkpoint splitting (front/back)
-- edge-cloud collaborative inference
-- codec experiments on transmitted activations
-- benchmark and reproducibility workflows
+## Purpose
 
-## Repository Guide
+- split checkpoints into `front` and `back`
+- run collaborative inference in local or remote mode
+- evaluate quality and latency with reproducible benchmarks
+- test activation codec variants
 
-- `split/`: checkpoint split tools  
-  See details: `split/README.md`
-- `model/`: split runtime and model-facing API  
-  See details: `model/README.md`
-- `bench/`: benchmark scripts and result format  
-  See details: `bench/README.md`
-- `custom/`: user-defined experimental codecs/modules
+## Files
+
+- `split/`: checkpoint splitting tools (`split/README.md`)
+- `model/`: runtime and model API (`model/README.md`)
+- `bench/`: benchmark scripts and JSON schema (`bench/README.md`)
+- `viz/`: visualization scripts (`viz/README.md`)
+- `custom/`: custom experimental codecs/modules
 - `tests/`: reference experiment scripts
-- `docs/`: notes and design documents
+- `docs/`: design notes
+
+## Usage
+
+```bash
+python -m split.ckpt --help
+python -m bench.ppl --help
+python -m bench.latency --help
+```

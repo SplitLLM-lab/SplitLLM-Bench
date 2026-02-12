@@ -1,20 +1,17 @@
-# viz
+# Viz
 
 Visualization scripts for SplitLLM experiments.
 
-## `activation.py`
+## Purpose
 
-Render token-level activation heatmaps from the split `front` model output.
+- render token-level activation heatmaps from front model outputs
+- save per-token heatmaps and one average-activation figure
 
-Features:
+## Files
 
-- Takes one input sentence (`--text`)
-- Saves token activation heatmaps
-- Uses `6` tokens per figure by default
-- Saves one final average-activation image as the last file
-- Auto-selects a CJK-capable font for Traditional Chinese when available
+- `viz/activation.py`: activation heatmap renderer
 
-Example:
+## Usage
 
 ```bash
 python -m viz.activation \
@@ -25,5 +22,8 @@ python -m viz.activation \
   --out_dir ./viz_out/activation
 ```
 
-If the environment is offline and tokenizer files are not cached, use a local tokenizer path with `--local_files_only`.
+## Notes
 
+- Default is `6` tokens per figure.
+- The script auto-selects a CJK-capable font when available.
+- In offline environments, use a local tokenizer path with `--local_files_only`.
