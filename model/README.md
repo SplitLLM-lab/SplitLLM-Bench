@@ -78,7 +78,7 @@ print(res.text)
 
 ## Custom Codec
 
-You can inject your own activation codec into both edge and server:
+You can inject your own activation codec into model:
 
 ```python
 import base64
@@ -93,17 +93,16 @@ from model import (
 )
 
 class MyCodec(ActivationCodec):
-    name = "my_codec"
+    name = "my codec"
 
-    def encode(self, hidden: torch.Tensor, *, context: CodecContext) -> EncodedActivation:
+    def encode(
+        self,
+        hidden: torch.Tensor,
+        *,
+        context: CodecContext,
+    ) -> EncodedActivation:
         del context
-        x = hidden.detach().to(torch.float32).cpu().numpy()
-        q = np.clip(np.round(x * 128.0), -128, 127).astype(np.int8)
-        b64 = base64.b64encode(q.tobytes()).decode("ascii")
-        return EncodedActivation(
-            data=b64,
-            meta={"shape": list(q.shape), "dtype": "int8", "scale": 128.0},
-        )
+        return EncodedActivation(data=hidden, meta={})
 
     def decode(
         self,
@@ -114,35 +113,28 @@ class MyCodec(ActivationCodec):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         del context
-        shape = payload.meta["shape"]
-        raw = base64.b64decode(payload.data.encode("ascii"))
-        q = np.frombuffer(raw, dtype=np.int8).reshape(shape)
-        x = torch.from_numpy(q.astype(np.float32) / float(payload.meta["scale"]))
-        x = x.to(device=device)
-        if dtype in (torch.float16, torch.bfloat16):
-            x = x.to(dtype)
-        return x
+        hidden = payload.data
+        return hidden
 
 codec = MyCodec()
 
-server = RemoteBackServer(
-    back_dir="./split_out/back",
-    codec=codec,
-)
-
 m = SplitLLMModel.from_pretrained(
-    mode="remote_back",
+    mode="local_split",
     tokenizer_id="Qwen/Qwen3-1.7B",
     front_dir="./split_out/front",
-    server_url="http://127.0.0.1:8000",
+    back_dir="./split_out/back",
+    device="auto",
+    dtype="auto",
     codec=codec,
 )
 
+
 res = m.generate(
-    prompt="test",
+    prompt="請自我介紹",
     max_new_tokens=32,
-    codec_extras={"quality": "aggressive", "level": 3},
 )
+
+print(res.text)
 ```
 
 If you prefer function-style codec, use `FunctionalActivationCodec`.

@@ -12,6 +12,7 @@ tests/
 docs/my_docs/
 split_out/
 ckpt_snap/
+bench/results/
 AGENTS.md
 test.py
 
