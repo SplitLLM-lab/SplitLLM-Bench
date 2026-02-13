@@ -12,7 +12,8 @@ Research codebase for split LLM edge-cloud inference experiments.
 ## Files
 
 - `split/`: checkpoint splitting tools (`split/README.md`)
-- `model/`: runtime and model API (`model/README.md`)
+- `model/`: model API and activation codec modules (`model/README.md`)
+- `runtime/`: local/remote runtime components and server/client CLI (`runtime/README.md`)
 - `bench/`: benchmark scripts and JSON schema (`bench/README.md`)
 - `viz/`: visualization scripts (`viz/README.md`)
 - `custom/`: custom experimental codecs/modules
@@ -23,6 +24,8 @@ Research codebase for split LLM edge-cloud inference experiments.
 
 ```bash
 python -m split.ckpt --help
+python -m runtime.server --help
+python -m runtime.client --help
 python -m bench.ppl --help
 python -m bench.latency --help
 ```

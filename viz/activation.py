@@ -16,7 +16,7 @@ import torch
 from matplotlib import font_manager, ft2font
 from transformers import AutoTokenizer
 
-from model.runtime import load_front_model, pick_device_and_dtype, resolve_dir
+from runtime import load_front_model, pick_device_and_dtype, resolve_dir
 
 
 @dataclass

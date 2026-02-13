@@ -15,7 +15,7 @@ from transformers.cache_utils import DynamicCache
 
 from model import CodecContext, LocalSplitRuntime, RemoteSplitRuntime, SamplingConfig
 from model.codec import ActivationCodec, EncodedActivation
-from model.runtime import (
+from runtime import (
     build_logits_processors,
     build_logits_warpers,
     encoded_to_payload,

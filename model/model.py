@@ -7,7 +7,7 @@ import torch
 from transformers import AutoTokenizer
 
 from .codec import ActivationCodec
-from .runtime import LocalSplitRuntime, RemoteSplitRuntime, RuntimeGenerateResult, SamplingConfig
+from runtime import LocalSplitRuntime, RemoteSplitRuntime, RuntimeGenerateResult, SamplingConfig
 
 
 @dataclass
