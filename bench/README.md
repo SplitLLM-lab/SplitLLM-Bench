@@ -13,6 +13,7 @@ Benchmark scripts for split inference quality and latency.
 - `bench/ppl.py`: PPL benchmark (local split runtime)
 - `bench/mmlu.py`: MMLU multiple-choice accuracy benchmark (local split runtime)
 - `bench/latency.py`: latency benchmark (local split or remote back)
+- `bench/generate_jsonl.py`: generic JSONL generation CLI (local split runtime)
 - `bench/utils.py`: shared helpers (codec loading, dataset loading, math)
 
 ## Usage
@@ -60,7 +61,7 @@ python3 -m bench.latency \
   --codec default
 ```
 
-MMLU (local split, greedy single-letter answer over A/B/C/D):
+MMLU (local split, single-letter answer over A/B/C/D):
 
 ```bash
 python3 -m bench.mmlu \
@@ -74,6 +75,25 @@ python3 -m bench.mmlu \
   --n_shot 5 \
   --max_samples_per_subject 100 \
   --max_length 2048 \
+  --decoding greedy \
+  --codec default
+```
+
+Direct JSONL generation (local split):
+
+```bash
+python3 -m bench.generate_jsonl \
+  --front_dir ./split_out/front \
+  --back_dir ./split_out/back \
+  --tokenizer_id Qwen/Qwen3-1.7B \
+  --input_jsonl ./data/prompts.jsonl \
+  --output_jsonl ./out/generated.jsonl \
+  --prompt_key prompt \
+  --result_key result \
+  --index_key index \
+  --decoding top_p \
+  --top_p 0.9 \
+  --max_new_tokens 64 \
   --codec default
 ```
 
@@ -83,6 +103,8 @@ python3 -m bench.mmlu \
 - `--codec` custom module forms: `custom.my_codec`, `custom.my_codec:build_codec`, `custom.registry.my_codec`.
 - `ppl.py` and `mmlu.py` are local-only; `latency.py` supports `local_split` and `remote_back`.
 - `latency.py --runtime_mode remote_back` requires a running server (`python3 -m runtime.server ...`).
-- `mmlu.py` defaults to `cais/mmlu` + 5-shot, prompts the model to output one uppercase option letter with greedy decoding, and supports custom dataset/config, subject filtering (`--subjects`), global sample cap (`--samples`), and per-subject cap (`--max_samples_per_subject`).
+- `mmlu.py` now uses a two-stage flow: prepare prompt JSONL -> generate with `generate_jsonl_with_model` -> score by single-letter parse. It supports `--decoding` (`greedy`, `top_k`, `top_p`) and related generation args.
+- `generate_jsonl.py` is the direct CLI wrapper for line-by-line JSONL generation; output rows are written incrementally and reordered by index at the end to match input order.
+- `generate_jsonl_with_model` is suitable for generation-first benchmarks (current fit: `mmlu.py`). It is not used in `ppl.py` (forward NLL) or `latency.py` (TTFT/transport latency metrics) because those require different measurement paths.
 - Result JSON keeps stable top-level fields: `benchmark`, `model`, `codec`, `dataset`, `runtime`, `eval`.
 - Main latency outputs include TTFT, system latency, decode-step latency, codec latency, and transfer bytes.

@@ -4,19 +4,25 @@ import argparse
 import json
 import random
 import string
+import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-from model import LocalSplitRuntime, SamplingConfig
+from model import LocalSplitRuntime, SplitLLMModel
 
-from bench.utils import build_codec, parse_codec_extras
+from bench.utils import (
+    build_codec,
+    build_generation_kwargs,
+    generate_jsonl_with_model,
+    parse_codec_extras,
+)
 
 
 CHOICE_LABELS = string.ascii_uppercase
@@ -30,11 +36,19 @@ class MCQItem:
     subject: str
 
 
+@dataclass
+class PreparedSample:
+    subject: str
+    labels: str
+    answer_idx: int
+    used_shots: int
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Benchmark MMLU multiple-choice accuracy for local split front/back checkpoints "
-            "using greedy single-letter answer generation (A/B/C/...)."
+            "Simple MMLU benchmark: load dataset, generate predictions from prompt JSONL, "
+            "then score accuracy."
         ),
     )
     p.add_argument("--front_dir", type=str, default="./split_out/front")
@@ -80,44 +94,39 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated subjects. Default: all subjects.",
     )
-    p.add_argument(
-        "--n_shot",
-        type=int,
-        default=5,
-        help="Few-shot examples per subject (default: 5).",
-    )
-    p.add_argument(
-        "--samples",
-        type=int,
-        default=-1,
-        help="Global max eval samples after filtering. <=0 means all.",
-    )
-    p.add_argument(
-        "--max_samples_per_subject",
-        type=int,
-        default=-1,
-        help="Per-subject max eval samples. <=0 means no per-subject cap.",
-    )
+    p.add_argument("--n_shot", type=int, default=5)
+    p.add_argument("--samples", type=int, default=-1)
+    p.add_argument("--max_samples_per_subject", type=int, default=-1)
     p.add_argument(
         "--max_length",
         type=int,
         default=2048,
-        help="Max sequence length for prompt + answer label token(s).",
+        help="Max sequence length for prompt + answer token(s).",
     )
+
+    p.add_argument(
+        "--decoding",
+        type=str,
+        default="greedy",
+        choices=["greedy", "top_k", "top_p"],
+    )
+    p.add_argument("--max_new_tokens", type=int, default=1)
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--top_k", type=int, default=50)
+    p.add_argument("--top_p", type=float, default=0.9)
+    p.add_argument("--min_new_tokens", type=int, default=0)
+    p.add_argument("--no_repeat_ngram_size", type=int, default=0)
+    p.add_argument("--repetition_penalty", type=float, default=1.0)
+
+    p.add_argument("--jsonl_num_workers", type=int, default=1)
+    p.add_argument("--jsonl_max_in_flight", type=int, default=0)
+    p.add_argument("--prompt_jsonl", type=str, default=None)
+    p.add_argument("--pred_jsonl", type=str, default=None)
 
     p.add_argument("--progress_every", type=int, default=20)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_json", type=str, default=None)
     return p.parse_args()
-
-
-def parse_subjects(raw: str | None) -> set[str] | None:
-    if raw is None:
-        return None
-    out = {x.strip() for x in raw.split(",") if x.strip()}
-    if not out:
-        return None
-    return out
 
 
 def parse_dataset_config(raw: str | None) -> str | None:
@@ -129,12 +138,14 @@ def parse_dataset_config(raw: str | None) -> str | None:
     return value
 
 
-def load_split(
-    *,
-    dataset_name: str,
-    dataset_config: str | None,
-    split: str,
-):
+def parse_subjects(raw: str | None) -> set[str] | None:
+    if raw is None:
+        return None
+    out = {x.strip() for x in raw.split(",") if x.strip()}
+    return out or None
+
+
+def load_split(*, dataset_name: str, dataset_config: str | None, split: str):
     if dataset_config is None:
         return load_dataset(dataset_name, split=split)
     return load_dataset(dataset_name, dataset_config, split=split)
@@ -144,12 +155,10 @@ def normalize_choices(raw: Any) -> list[str]:
     if isinstance(raw, (list, tuple)):
         choices = [str(x).strip() for x in raw]
     elif isinstance(raw, dict):
-        if "text" in raw and isinstance(raw["text"], (list, tuple)):
-            choices = [str(x).strip() for x in raw["text"]]
-        elif "choices" in raw and isinstance(raw["choices"], (list, tuple)):
-            choices = [str(x).strip() for x in raw["choices"]]
-        else:
+        values = raw.get("text", raw.get("choices"))
+        if not isinstance(values, (list, tuple)):
             raise ValueError("choices dict must contain list field 'text' or 'choices'")
+        choices = [str(x).strip() for x in values]
     else:
         raise ValueError(f"unsupported choices type: {type(raw).__name__}")
 
@@ -157,29 +166,27 @@ def normalize_choices(raw: Any) -> list[str]:
     if len(choices) < 2:
         raise ValueError("choices must contain at least 2 options")
     if len(choices) > len(CHOICE_LABELS):
-        raise ValueError(
-            f"choices count {len(choices)} exceeds supported labels {len(CHOICE_LABELS)}"
-        )
+        raise ValueError("choices count exceeds supported labels")
     return choices
 
 
-def answer_to_index(raw: Any, choices: list[str]) -> int:
+def parse_answer_index(raw: Any, choices: list[str]) -> int:
     n = len(choices)
     if isinstance(raw, bool):
-        raise ValueError("boolean answer is not valid")
+        raise ValueError("boolean answer is invalid")
 
     if isinstance(raw, int):
         idx = int(raw)
         if 0 <= idx < n:
             return idx
-        raise ValueError(f"answer index {idx} out of range for {n} choices")
+        raise ValueError("answer index out of range")
 
     if isinstance(raw, float):
         if raw.is_integer():
             idx = int(raw)
             if 0 <= idx < n:
                 return idx
-        raise ValueError(f"answer float {raw} is invalid for {n} choices")
+        raise ValueError("answer float is invalid")
 
     txt = str(raw).strip()
     if txt == "":
@@ -189,7 +196,7 @@ def answer_to_index(raw: Any, choices: list[str]) -> int:
         idx = int(txt)
         if 0 <= idx < n:
             return idx
-        raise ValueError(f"answer index {idx} out of range for {n} choices")
+        raise ValueError("answer index out of range")
 
     up = txt.upper()
     if len(up) == 1 and up in CHOICE_LABELS[:n]:
@@ -199,10 +206,10 @@ def answer_to_index(raw: Any, choices: list[str]) -> int:
         if txt == choice:
             return i
 
-    raise ValueError(f"cannot parse answer value {raw!r}")
+    raise ValueError(f"cannot parse answer value: {raw!r}")
 
 
-def to_items(
+def parse_items(
     *,
     ds,
     question_column: str,
@@ -210,34 +217,21 @@ def to_items(
     answer_column: str,
     subject_column: str,
     default_subject: str,
-    requested_subjects: set[str] | None,
+    subject_filter: set[str] | None,
 ) -> list[MCQItem]:
     items: list[MCQItem] = []
     dropped = 0
 
     for row in ds:
         try:
-            if question_column not in row:
-                raise ValueError(f"missing question column: {question_column!r}")
-            if choices_column not in row:
-                raise ValueError(f"missing choices column: {choices_column!r}")
-            if answer_column not in row:
-                raise ValueError(f"missing answer column: {answer_column!r}")
-
-            question = str(row.get(question_column, "")).strip()
+            question = str(row[question_column]).strip()
+            choices = normalize_choices(row[choices_column])
+            answer_idx = parse_answer_index(row[answer_column], choices)
+            subject = str(row.get(subject_column, default_subject)).strip() or default_subject
+            if subject_filter is not None and subject not in subject_filter:
+                continue
             if question == "":
                 raise ValueError("empty question")
-
-            choices = normalize_choices(row.get(choices_column))
-            answer_idx = answer_to_index(row.get(answer_column), choices)
-
-            subject = str(row.get(subject_column, default_subject)).strip()
-            if subject == "":
-                subject = default_subject
-
-            if requested_subjects is not None and subject not in requested_subjects:
-                continue
-
             items.append(
                 MCQItem(
                     question=question,
@@ -254,34 +248,6 @@ def to_items(
     return items
 
 
-def make_subject_groups(items: list[MCQItem]) -> dict[str, list[MCQItem]]:
-    groups: dict[str, list[MCQItem]] = defaultdict(list)
-    for item in items:
-        groups[item.subject].append(item)
-    return groups
-
-
-def build_support_pool(
-    *,
-    items: list[MCQItem],
-    n_shot: int,
-    seed: int,
-) -> dict[str, list[MCQItem]]:
-    groups = make_subject_groups(items)
-    pool: dict[str, list[MCQItem]] = {}
-    if n_shot <= 0:
-        for subject in groups:
-            pool[subject] = []
-        return pool
-
-    for offset, subject in enumerate(sorted(groups)):
-        rows = list(groups[subject])
-        rng = random.Random(seed + offset)
-        rng.shuffle(rows)
-        pool[subject] = rows[: int(n_shot)]
-    return pool
-
-
 def select_eval_items(
     *,
     items: list[MCQItem],
@@ -290,29 +256,45 @@ def select_eval_items(
     seed: int,
 ) -> list[MCQItem]:
     rng = random.Random(seed)
-    selected: list[MCQItem] = []
-
-    if max_samples_per_subject > 0:
-        groups = make_subject_groups(items)
+    if max_samples_per_subject <= 0:
+        selected = list(items)
+    else:
+        groups: dict[str, list[MCQItem]] = defaultdict(list)
+        for item in items:
+            groups[item.subject].append(item)
+        selected = []
         for subject in sorted(groups):
             rows = list(groups[subject])
             rng.shuffle(rows)
             selected.extend(rows[: int(max_samples_per_subject)])
-    else:
-        selected = list(items)
 
     if samples > 0 and len(selected) > samples:
         rng.shuffle(selected)
         selected = selected[: int(samples)]
-
     return selected
+
+
+def build_support_pool(*, items: list[MCQItem], n_shot: int, seed: int) -> dict[str, list[MCQItem]]:
+    groups: dict[str, list[MCQItem]] = defaultdict(list)
+    for item in items:
+        groups[item.subject].append(item)
+
+    pool: dict[str, list[MCQItem]] = {}
+    for offset, subject in enumerate(sorted(groups)):
+        rows = list(groups[subject])
+        random.Random(seed + offset).shuffle(rows)
+        if n_shot > 0:
+            pool[subject] = rows[: int(n_shot)]
+        else:
+            pool[subject] = []
+    return pool
 
 
 def subject_display_name(subject: str) -> str:
     return subject.replace("_", " ").strip()
 
 
-def format_question_block(item: MCQItem, answer_label: str | None) -> str:
+def format_question(item: MCQItem, answer_label: str | None) -> str:
     lines = [item.question]
     for i, choice in enumerate(item.choices):
         lines.append(f"{CHOICE_LABELS[i]}. {choice}")
@@ -323,12 +305,7 @@ def format_question_block(item: MCQItem, answer_label: str | None) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(
-    *,
-    subject: str,
-    support_examples: list[MCQItem],
-    query_item: MCQItem,
-) -> str:
+def build_prompt(*, subject: str, support_examples: list[MCQItem], query_item: MCQItem) -> str:
     lines = [
         (
             "The following are multiple choice questions (with answers) "
@@ -338,73 +315,115 @@ def build_prompt(
         "",
     ]
     for ex in support_examples:
-        lines.append(format_question_block(ex, CHOICE_LABELS[ex.answer_idx]))
+        lines.append(format_question(ex, CHOICE_LABELS[ex.answer_idx]))
         lines.append("")
-    lines.append(format_question_block(query_item, None))
+    lines.append(format_question(query_item, None))
     return "\n".join(lines)
 
 
-def build_label_token_first_ids(tokenizer) -> dict[str, set[int]]:
-    ids_map: dict[str, set[int]] = {}
-    for label in CHOICE_LABELS:
-        ids: set[int] = set()
-        for text in (f" {label}", label):
-            token_ids = tokenizer(text, add_special_tokens=False).input_ids
-            if token_ids:
-                ids.add(int(token_ids[0]))
-        if not ids:
-            raise ValueError(
-                f"tokenizer returned empty ids for answer label {label!r}"
+def prepare_prompts(
+    *,
+    eval_items: list[MCQItem],
+    support_pool: dict[str, list[MCQItem]],
+    tokenizer,
+    n_shot: int,
+    max_length: int,
+    max_new_tokens: int,
+    fewshot_split: str,
+    eval_split: str,
+    progress_every: int,
+) -> tuple[list[str], list[PreparedSample], int]:
+    prompts: list[str] = []
+    prepared: list[PreparedSample] = []
+    skipped_too_long = 0
+    answer_budget = max(1, int(max_new_tokens))
+    progress_step = max(1, int(progress_every))
+
+    for i, item in enumerate(eval_items, start=1):
+        labels = CHOICE_LABELS[: len(item.choices)]
+        support = list(support_pool.get(item.subject, []))
+        if fewshot_split == eval_split:
+            support = [x for x in support if x.question != item.question]
+
+        used_shots = min(len(support), max(0, int(n_shot)))
+        chosen_prompt: str | None = None
+        chosen_shots = -1
+        while used_shots >= 0:
+            prompt = build_prompt(
+                subject=item.subject,
+                support_examples=support[:used_shots],
+                query_item=item,
             )
-        ids_map[label] = ids
-    return ids_map
+            prompt_len = int(
+                tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.shape[1]
+            )
+            if prompt_len > 0 and (prompt_len + answer_budget) <= int(max_length):
+                chosen_prompt = prompt
+                chosen_shots = used_shots
+                break
+            used_shots -= 1
+
+        if chosen_prompt is None:
+            skipped_too_long += 1
+            continue
+
+        prompts.append(chosen_prompt)
+        prepared.append(
+            PreparedSample(
+                subject=item.subject,
+                labels=labels,
+                answer_idx=item.answer_idx,
+                used_shots=int(chosen_shots),
+            )
+        )
+
+        if i % progress_step == 0:
+            print(
+                f"[progress] prepared {i}/{len(eval_items)}, "
+                f"ready={len(prepared)}, skipped_too_long={skipped_too_long}"
+            )
+
+    return prompts, prepared, skipped_too_long
 
 
-def parse_generated_label(text: str, labels: str) -> int | None:
+def write_prompt_jsonl(path: Path, prompts: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fout:
+        for prompt in prompts:
+            fout.write(json.dumps({"prompt": prompt}, ensure_ascii=False))
+            fout.write("\n")
+    print(f"[ok] wrote prompt jsonl rows={len(prompts)} path={path}")
+
+
+def load_predictions(path: Path, expected_rows: int) -> list[str]:
+    out: list[str | None] = [None] * int(expected_rows)
+    seen = 0
+    with path.open("r", encoding="utf-8") as fin:
+        for line_no, line in enumerate(fin, start=1):
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            if not isinstance(obj, dict):
+                raise ValueError(f"line {line_no} in {path} is not a JSON object")
+            if "index" not in obj:
+                raise ValueError(f"line {line_no} in {path} missing key 'index'")
+            idx = int(obj["index"])
+            if idx < 0 or idx >= int(expected_rows):
+                raise ValueError(f"line {line_no} in {path} has out-of-range index {idx}")
+            if out[idx] is not None:
+                raise ValueError(f"line {line_no} in {path} duplicated index {idx}")
+            out[idx] = str(obj.get("result", ""))
+            seen += 1
+
+    if seen != int(expected_rows):
+        raise ValueError(f"prediction rows mismatch: expected {expected_rows}, found {seen}")
+    return [str(x) for x in out]
+
+
+def parse_predicted_label(text: str, labels: str) -> int | None:
     for ch in text.strip().upper():
         if ch in labels:
             return labels.index(ch)
-    return None
-
-
-@torch.no_grad()
-def greedy_predict_choice(
-    *,
-    runtime: LocalSplitRuntime,
-    tokenizer,
-    prefix_ids: torch.Tensor,
-    labels: str,
-    label_token_first_ids: dict[str, set[int]],
-    stop_token_ids: set[int],
-    sampling: SamplingConfig,
-    codec_extras: dict[str, Any],
-) -> int | None:
-    attention_mask = torch.ones_like(prefix_ids)
-    result = runtime.generate_from_ids(
-        input_ids=prefix_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=1,
-        eos_token_id=(
-            int(tokenizer.eos_token_id)
-            if tokenizer.eos_token_id is not None
-            else None
-        ),
-        stop_token_ids=stop_token_ids,
-        sampling=sampling,
-        codec_extras=codec_extras,
-    )
-    if not result.generated_token_ids:
-        return None
-
-    token_id = int(result.generated_token_ids[0])
-    decoded = tokenizer.decode([token_id], skip_special_tokens=True)
-    parsed = parse_generated_label(decoded, labels)
-    if parsed is not None:
-        return parsed
-
-    for i, label in enumerate(labels):
-        if token_id in label_token_first_ids.get(label, set()):
-            return i
     return None
 
 
@@ -414,13 +433,13 @@ def mean(xs: list[float]) -> float:
     return float(sum(xs) / len(xs))
 
 
-def run(args: argparse.Namespace) -> Dict[str, Any]:
+def run(args: argparse.Namespace) -> dict[str, Any]:
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(args.seed))
 
     dataset_config = parse_dataset_config(args.dataset_config)
-    requested_subjects = parse_subjects(args.subjects)
+    subject_filter = parse_subjects(args.subjects)
     codec_extras = parse_codec_extras(args.codec_extras_json)
     codec = build_codec(args.codec)
 
@@ -443,42 +462,40 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         tokenizer.pad_token = tokenizer.eos_token
 
     default_subject = dataset_config if dataset_config is not None else "default"
-    ds_fewshot = load_split(
+    fewshot_ds = load_split(
         dataset_name=args.dataset_name,
         dataset_config=dataset_config,
         split=args.fewshot_split,
     )
-    ds_eval = load_split(
+    eval_ds = load_split(
         dataset_name=args.dataset_name,
         dataset_config=dataset_config,
         split=args.eval_split,
     )
 
-    fewshot_items = to_items(
-        ds=ds_fewshot,
+    fewshot_items = parse_items(
+        ds=fewshot_ds,
         question_column=args.question_column,
         choices_column=args.choices_column,
         answer_column=args.answer_column,
         subject_column=args.subject_column,
         default_subject=default_subject,
-        requested_subjects=requested_subjects,
+        subject_filter=subject_filter,
     )
-    eval_items = to_items(
-        ds=ds_eval,
+    eval_items = parse_items(
+        ds=eval_ds,
         question_column=args.question_column,
         choices_column=args.choices_column,
         answer_column=args.answer_column,
         subject_column=args.subject_column,
         default_subject=default_subject,
-        requested_subjects=requested_subjects,
+        subject_filter=subject_filter,
     )
 
     if not eval_items:
-        raise ValueError(
-            "no valid eval rows after parsing/filtering; check dataset/split/columns/subjects"
-        )
+        raise ValueError("no valid eval rows after parsing/filtering")
     if int(args.n_shot) > 0 and not fewshot_items:
-        print("[warn] few-shot split has no usable rows; benchmark falls back to zero-shot")
+        print("[warn] few-shot split has no usable rows; fallback to zero-shot")
 
     eval_items = select_eval_items(
         items=eval_items,
@@ -494,23 +511,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         n_shot=max(0, int(args.n_shot)),
         seed=int(args.seed),
     )
-    label_token_first_ids = build_label_token_first_ids(tokenizer)
-    eos_token_id = (
-        int(tokenizer.eos_token_id)
-        if tokenizer.eos_token_id is not None
-        else None
-    )
-    stop_token_ids: set[int] = set()
-    if eos_token_id is not None:
-        stop_token_ids.add(eos_token_id)
-    vocab = tokenizer.get_vocab()
-    if "<|im_end|>" in vocab:
-        stop_token_ids.add(int(vocab["<|im_end|>"]))
-    sampling = SamplingConfig(do_sample=False)
+
+    max_in_flight = None if int(args.jsonl_max_in_flight) <= 0 else int(args.jsonl_max_in_flight)
     progress_every = max(1, int(args.progress_every))
 
     print(f"[info] benchmark=mmlu mode=local_split codec={codec.name}")
-    print(f"[info] device={runtime.device}, dtype={runtime.dtype}, decoding=greedy")
+    print(
+        f"[info] device={runtime.device}, dtype={runtime.dtype}, "
+        f"decoding={args.decoding}, max_new_tokens={int(args.max_new_tokens)}"
+    )
     print(
         "[info] dataset="
         f"{args.dataset_name}/{dataset_config if dataset_config is not None else '<none>'} "
@@ -521,82 +530,109 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         f"max_length={int(args.max_length)}"
     )
 
+    t0 = time.perf_counter()
+    prompts, prepared, skipped_too_long = prepare_prompts(
+        eval_items=eval_items,
+        support_pool=support_pool,
+        tokenizer=tokenizer,
+        n_shot=int(args.n_shot),
+        max_length=int(args.max_length),
+        max_new_tokens=int(args.max_new_tokens),
+        fewshot_split=str(args.fewshot_split),
+        eval_split=str(args.eval_split),
+        progress_every=progress_every,
+    )
+    if not prepared:
+        raise ValueError("all eval rows were skipped by max_length; increase --max_length")
+
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        if args.prompt_jsonl:
+            prompt_path = Path(args.prompt_jsonl).expanduser()
+        else:
+            temp_dir = tempfile.TemporaryDirectory(prefix="splitllm_mmlu_")
+            prompt_path = Path(temp_dir.name) / "prompts.jsonl"
+
+        if args.pred_jsonl:
+            pred_path = Path(args.pred_jsonl).expanduser()
+            if temp_dir is None:
+                temp_dir = tempfile.TemporaryDirectory(prefix="splitllm_mmlu_")
+        else:
+            if temp_dir is None:
+                temp_dir = tempfile.TemporaryDirectory(prefix="splitllm_mmlu_")
+            pred_path = Path(temp_dir.name) / "predictions.jsonl"
+
+        write_prompt_jsonl(prompt_path, prompts)
+
+        model = SplitLLMModel(mode="local_split", tokenizer=tokenizer, runtime=runtime)
+        generation_kwargs = build_generation_kwargs(
+            decoding=str(args.decoding),
+            max_new_tokens=int(args.max_new_tokens),
+            temperature=float(args.temperature),
+            top_k=int(args.top_k),
+            top_p=float(args.top_p),
+            min_new_tokens=int(args.min_new_tokens),
+            no_repeat_ngram_size=int(args.no_repeat_ngram_size),
+            repetition_penalty=float(args.repetition_penalty),
+        )
+        generation_kwargs["codec_extras"] = codec_extras
+        generation_kwargs["use_chat_template"] = False
+        generation_kwargs["add_generation_prompt"] = False
+        generation_kwargs["skip_special_tokens"] = True
+
+        generated_rows = generate_jsonl_with_model(
+            model=model,
+            input_path=prompt_path,
+            output_path=pred_path,
+            generation_kwargs=generation_kwargs,
+            prompt_key="prompt",
+            result_key="result",
+            index_key="index",
+            num_workers=int(args.jsonl_num_workers),
+            max_in_flight=max_in_flight,
+            progress_every=progress_every,
+            keep_index=True,
+        )
+        if generated_rows != len(prepared):
+            raise RuntimeError(
+                f"generated rows mismatch: expected {len(prepared)}, got {generated_rows}"
+            )
+
+        predictions = load_predictions(pred_path, expected_rows=len(prepared))
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+
     correct = 0
     evaluated = 0
-    skipped_too_long = 0
     skipped_invalid_answer = 0
-    used_shots_all: list[float] = []
+    used_shots: list[float] = []
     subject_total: dict[str, int] = defaultdict(int)
     subject_correct: dict[str, int] = defaultdict(int)
 
-    t0 = time.perf_counter()
-
-    for i, item in enumerate(eval_items):
-        labels = CHOICE_LABELS[: len(item.choices)]
-        max_answer_tokens = 1
-        support = list(support_pool.get(item.subject, []))
-        if args.fewshot_split == args.eval_split:
-            support = [x for x in support if x.question != item.question]
-
-        used_shots = min(len(support), max(0, int(args.n_shot)))
-        prefix_ids: torch.Tensor | None = None
-        while used_shots >= 0:
-            prompt = build_prompt(
-                subject=item.subject,
-                support_examples=support[:used_shots],
-                query_item=item,
-            )
-            encoded = tokenizer(
-                prompt,
-                add_special_tokens=False,
-                return_tensors="pt",
-            ).input_ids.to(runtime.device)
-            if int(encoded.shape[1]) <= 0:
-                break
-            if int(encoded.shape[1]) + max_answer_tokens <= int(args.max_length):
-                prefix_ids = encoded
-                break
-            used_shots -= 1
-
-        if prefix_ids is None or used_shots < 0:
-            skipped_too_long += 1
-            continue
-
-        pred_idx = greedy_predict_choice(
-            runtime=runtime,
-            tokenizer=tokenizer,
-            prefix_ids=prefix_ids,
-            labels=labels,
-            label_token_first_ids=label_token_first_ids,
-            stop_token_ids=stop_token_ids,
-            sampling=sampling,
-            codec_extras=codec_extras,
-        )
+    for i, meta in enumerate(prepared, start=1):
+        pred_idx = parse_predicted_label(predictions[i - 1], meta.labels)
         if pred_idx is None:
             skipped_invalid_answer += 1
             continue
 
-        is_correct = pred_idx == item.answer_idx
-
+        ok = pred_idx == meta.answer_idx
         evaluated += 1
-        correct += int(is_correct)
-        used_shots_all.append(float(used_shots))
-        subject_total[item.subject] += 1
-        subject_correct[item.subject] += int(is_correct)
+        correct += int(ok)
+        used_shots.append(float(meta.used_shots))
+        subject_total[meta.subject] += 1
+        subject_correct[meta.subject] += int(ok)
 
-        if ((i + 1) % progress_every) == 0:
+        if i % progress_every == 0:
             running_acc = float(correct / max(1, evaluated))
             print(
-                f"[progress] processed {i + 1}/{len(eval_items)}, "
+                f"[progress] scored {i}/{len(prepared)}, "
                 f"evaluated={evaluated}, acc={running_acc:.4f}, "
                 f"skipped_too_long={skipped_too_long}, skipped_invalid={skipped_invalid_answer}"
             )
 
     if evaluated <= 0:
-        raise ValueError(
-            "all selected eval rows were skipped (max_length too small or invalid generated answers); "
-            "increase --max_length or inspect answer parsing"
-        )
+        raise ValueError("all generated rows were invalid during answer parsing")
 
     elapsed_sec = time.perf_counter() - t0
     accuracy = float(correct / max(1, evaluated))
@@ -615,11 +651,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             }
         )
 
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "benchmark": {
             "name": "mmlu",
             "mode": "local_split",
-            "scoring": "greedy_single_letter",
+            "scoring": "jsonl_generate_then_single_letter_parse",
         },
         "model": {
             "front_dir": str(Path(args.front_dir).expanduser()),
@@ -640,7 +676,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "choices_column": args.choices_column,
             "answer_column": args.answer_column,
             "subject_column": args.subject_column,
-            "subjects": sorted(requested_subjects) if requested_subjects is not None else None,
+            "subjects": sorted(subject_filter) if subject_filter is not None else None,
         },
         "runtime": {
             "device": str(runtime.device),
@@ -650,14 +686,17 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         },
         "eval": {
             "samples_selected": int(len(eval_items)),
+            "samples_prepared": int(len(prepared)),
             "samples_evaluated": int(evaluated),
             "samples_skipped_too_long": int(skipped_too_long),
             "samples_skipped_invalid_answer": int(skipped_invalid_answer),
             "samples_limit": int(args.samples),
             "max_samples_per_subject": int(args.max_samples_per_subject),
             "n_shot_requested": int(args.n_shot),
-            "n_shot_used_mean": float(mean(used_shots_all)),
+            "n_shot_used_mean": float(mean(used_shots)),
             "max_length": int(args.max_length),
+            "decoding": str(args.decoding),
+            "max_new_tokens": int(args.max_new_tokens),
             "correct": int(correct),
             "accuracy": float(accuracy),
             "elapsed_sec": float(elapsed_sec),
@@ -669,7 +708,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     print("\n[result]")
     print(
-        f"Evaluated: {evaluated}/{len(eval_items)} "
+        f"Evaluated: {evaluated}/{len(prepared)} "
         f"(skipped_too_long={skipped_too_long}, skipped_invalid={skipped_invalid_answer})"
     )
     print(f"Accuracy: {accuracy:.6f} ({correct}/{max(1, evaluated)})")
