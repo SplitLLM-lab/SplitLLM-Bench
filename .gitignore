@@ -9,12 +9,12 @@ __pycache__/
 # SplitLLM specific
 
 tests/
+tests_out/
 docs/my_docs/
 split_out/
 ckpt_snap/
 bench/results/
 viz_out/
-AGENTS.md
 test.py
 
 # Distribution / packaging

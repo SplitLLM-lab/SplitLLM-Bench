@@ -189,6 +189,23 @@ def route_other_key(
         other_keys.append(key)
 
 
+def ensure_back_lm_head_weight(
+    front_sd: dict[str, Any],
+    back_sd: dict[str, Any],
+) -> bool:
+    head_key = "lm_head.weight"
+    embed_key = "model.embed_tokens.weight"
+    if head_key in back_sd:
+        return False
+    if embed_key not in front_sd:
+        raise KeyError(
+            "missing lm_head.weight in source checkpoint and cannot recover because "
+            "model.embed_tokens.weight was not routed to front split"
+        )
+    back_sd[head_key] = front_sd[embed_key].clone()
+    return True
+
+
 def split_checkpoint(
     shards: list[Path],
     adapter: SplitAdapter,
@@ -248,6 +265,13 @@ def split_checkpoint(
 
                 tensor = reader.get_tensor(key) if keep_other != "drop" else None
                 route_other_key(key, tensor, keep_other, front_sd, back_sd, other_keys)
+
+    injected = ensure_back_lm_head_weight(front_sd, back_sd)
+    if injected:
+        print(
+            "[warn] lm_head.weight missing in source shards; copied from "
+            "model.embed_tokens.weight into back checkpoint"
+        )
 
     stats = SplitStats(
         scanned_keys=scanned,
