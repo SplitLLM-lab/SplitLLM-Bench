@@ -238,9 +238,9 @@ Avoid hidden behavior.
 
 Use this project environment by default:
 
-- Activate path: `/home/nwlab/b2gan/.venv/bin/activate`
-- Preferred executables: `/home/nwlab/b2gan/.venv/bin/python`, `/home/nwlab/b2gan/.venv/bin/uv`
-- For shell commands, run with: `source /home/nwlab/b2gan/.venv/bin/activate && <command>`
+- Create/activate virtual environment under repo root: `.venv`
+- Preferred executables: `.venv/bin/python`, `.venv/bin/uv`
+- For shell commands, run with: `source .venv/bin/activate && <command>`
 - If a task involves running models / LLM inference, full end-to-end execution is optional for agent verification; syntax and basic runnability checks are enough, and the user can run full tests.
 
 ---

@@ -1,0 +1,9 @@
+torch
+transformers
+accelerate
+datasets
+numpy
+requests
+fastapi
+pydantic
+matplotlib

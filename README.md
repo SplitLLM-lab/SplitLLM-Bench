@@ -22,6 +22,21 @@ Research codebase for split LLM edge-cloud inference experiments.
 
 ## Usage
 
+### Setup with uv
+
+```bash
+# 1) create virtual environment
+uv venv .venv
+
+# 2) activate venv
+source .venv/bin/activate
+
+# 3) install dependencies
+uv pip install -r requirement.txt
+```
+
+### Run with python (activated venv)
+
 ```bash
 python -m split.ckpt --help
 python -m runtime.server --help
