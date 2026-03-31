@@ -59,6 +59,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--dtype", type=str, default="auto")
     p.add_argument(
+        "--front_quant",
+        type=str,
+        default="none",
+        help="Front model quant mode: none or bnb_8bit (aliases: hf_int8/int8/bnb).",
+    )
+    p.add_argument(
+        "--back_quant",
+        type=str,
+        default="none",
+        help="Back model quant mode: none or bnb_8bit (aliases: hf_int8/int8/bnb).",
+    )
+    p.add_argument(
         "--codec",
         type=str,
         default="default",
@@ -448,6 +460,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         back_dir=args.back_dir,
         device=args.device,
         dtype=args.dtype,
+        front_quant=args.front_quant,
+        back_quant=args.back_quant,
         revision=args.revision,
         codec=codec,
     )

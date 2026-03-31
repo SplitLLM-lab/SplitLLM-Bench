@@ -29,6 +29,8 @@ m = SplitLLMModel.from_pretrained(
     back_dir="./split_out/back",
     device="auto",
     dtype="auto",
+    front_quant="none",
+    back_quant="none",
 )
 
 res = m.generate(prompt="Explain split inference in two sentences.", max_new_tokens=64)
@@ -42,4 +44,6 @@ print(res.text)
 - You can pass custom codecs via `codec=...` (`ActivationCodec` or `FunctionalActivationCodec`).
 - Remote server/client setup and CLI examples are documented in `runtime/README.md`.
 - In `remote_back` mode, edge and server must use compatible codec logic.
+- Quant modes are `none` and `bnb_8bit` (aliases: `hf_int8`, `int8`, `bnb`).
+- In `remote_back` mode, configure front quant via model/client and back quant via server.
 - `generate(...)` returns `GenerateResult` with text, token IDs, finish reason, and timing fields.

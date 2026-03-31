@@ -19,6 +19,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--timeout_sec", type=float, default=120.0)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--dtype", type=str, default="auto")
+    p.add_argument(
+        "--front_quant",
+        type=str,
+        default="none",
+        help="Front model quant mode: none or bnb_8bit (aliases: hf_int8/int8/bnb).",
+    )
     p.add_argument("--revision", type=str, default=None)
     p.add_argument(
         "--codec",
@@ -74,6 +80,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         server_url=args.server_url,
         device=args.device,
         dtype=args.dtype,
+        front_quant=args.front_quant,
         timeout_sec=float(args.timeout_sec),
         revision=args.revision,
         codec=codec,

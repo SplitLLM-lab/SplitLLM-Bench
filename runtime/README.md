@@ -28,6 +28,7 @@ server = RemoteBackServer(
     back_dir="./split_out/back",
     device="auto",
     dtype="auto",
+    back_quant="none",
 )
 server.run(host="0.0.0.0", port=8000)
 ```
@@ -39,6 +40,7 @@ python3 -m runtime.server \
   --back_dir ./split_out/back \
   --host 0.0.0.0 \
   --port 8000 \
+  --back_quant none \
   --codec default
 ```
 
@@ -54,6 +56,7 @@ m = SplitLLMModel.from_pretrained(
     server_url="http://127.0.0.1:8000",
     device="auto",
     dtype="auto",
+    front_quant="none",
 )
 
 res = m.generate(prompt="Briefly compare TTFT and token RTT.", max_new_tokens=64)
@@ -67,6 +70,7 @@ python3 -m runtime.client \
   --front_dir ./split_out/front \
   --tokenizer_id Qwen/Qwen3-1.7B \
   --server_url http://127.0.0.1:8000 \
+  --front_quant none \
   --prompt "Briefly compare TTFT and token RTT." \
   --max_new_tokens 64 \
   --codec default
@@ -76,4 +80,6 @@ python3 -m runtime.client \
 
 - `runtime.client` internally uses `SplitLLMModel(mode="remote_back")`.
 - Builtin codecs are `default` and `identity_fp32`; custom module specs are supported.
+- Quant modes are `none` and `bnb_8bit` (aliases: `hf_int8`, `int8`, `bnb`).
+- `bnb_8bit` requires CUDA + `bitsandbytes`.
 - Local split runtime class is `runtime.local.LocalSplitRuntime` (no dedicated CLI entrypoint).

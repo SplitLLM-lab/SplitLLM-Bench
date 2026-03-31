@@ -107,6 +107,7 @@ class RemoteBackServer:
         revision: str | None = None,
         session_ttl_sec: int = 1800,
         codec: ActivationCodec | None = None,
+        back_quant: str = "none",
     ):
         self.device, self.dtype = pick_device_and_dtype(device, dtype)
         self.codec = ensure_codec(codec)
@@ -116,9 +117,15 @@ class RemoteBackServer:
 
         print(
             f"[info] loading remote back={self.back_dir} "
-            f"device={self.device} dtype={self.dtype} codec={self.codec.name}"
+            f"device={self.device} dtype={self.dtype} codec={self.codec.name} "
+            f"back_quant={back_quant}"
         )
-        self.back = load_back_model(self.back_dir, self.device, self.dtype)
+        self.back = load_back_model(
+            self.back_dir,
+            self.device,
+            self.dtype,
+            quant_mode=back_quant,
+        )
         print("[ok] remote back runtime ready")
 
         self.app = FastAPI(title="SplitLLM Remote Back Server")
@@ -401,6 +408,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_level", type=str, default="info")
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--dtype", type=str, default="auto")
+    p.add_argument(
+        "--back_quant",
+        type=str,
+        default="none",
+        help="Back model quant mode: none or bnb_8bit (aliases: hf_int8/int8/bnb).",
+    )
     p.add_argument("--revision", type=str, default=None)
     p.add_argument("--session_ttl_sec", type=int, default=1800)
     p.add_argument(
@@ -426,6 +439,7 @@ def main() -> int:
             back_dir=args.back_dir,
             device=args.device,
             dtype=args.dtype,
+            back_quant=args.back_quant,
             revision=args.revision,
             session_ttl_sec=int(args.session_ttl_sec),
             codec=codec,

@@ -165,6 +165,7 @@ class RemoteSplitRuntime:
         timeout_sec: float = 120.0,
         revision: str | None = None,
         codec: ActivationCodec | None = None,
+        front_quant: str = "none",
     ):
         self.device, self.dtype = pick_device_and_dtype(device, dtype)
         self.codec = ensure_codec(codec)
@@ -177,9 +178,15 @@ class RemoteSplitRuntime:
 
         print(
             f"[info] loading remote_front front={front_local} "
-            f"device={self.device} dtype={self.dtype} codec={self.codec.name}"
+            f"device={self.device} dtype={self.dtype} codec={self.codec.name} "
+            f"front_quant={front_quant}"
         )
-        self.front = load_front_model(front_local, self.device, self.dtype)
+        self.front = load_front_model(
+            front_local,
+            self.device,
+            self.dtype,
+            quant_mode=front_quant,
+        )
         print(f"[ok] remote_front runtime ready (server={server_url.rstrip('/')})")
 
     @torch.no_grad()

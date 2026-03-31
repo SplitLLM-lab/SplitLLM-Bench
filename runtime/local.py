@@ -30,6 +30,8 @@ class LocalSplitRuntime:
         dtype: str = "auto",
         revision: str | None = None,
         codec: ActivationCodec | None = None,
+        front_quant: str = "none",
+        back_quant: str = "none",
     ):
         self.device, self.dtype = pick_device_and_dtype(device, dtype)
         self.codec = ensure_codec(codec)
@@ -38,10 +40,21 @@ class LocalSplitRuntime:
 
         print(
             f"[info] loading local_split front={front_local} back={back_local} "
-            f"device={self.device} dtype={self.dtype} codec={self.codec.name}"
+            f"device={self.device} dtype={self.dtype} codec={self.codec.name} "
+            f"front_quant={front_quant} back_quant={back_quant}"
         )
-        self.front = load_front_model(front_local, self.device, self.dtype)
-        self.back = load_back_model(back_local, self.device, self.dtype)
+        self.front = load_front_model(
+            front_local,
+            self.device,
+            self.dtype,
+            quant_mode=front_quant,
+        )
+        self.back = load_back_model(
+            back_local,
+            self.device,
+            self.dtype,
+            quant_mode=back_quant,
+        )
         print("[ok] local_split runtime ready")
 
     @torch.no_grad()

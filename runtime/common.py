@@ -58,7 +58,67 @@ def resolve_dir(path_or_repo: str, revision: str | None = None) -> str:
     return str(Path(local_dir).resolve())
 
 
-def load_front_model(front_dir: str, device: torch.device, dtype: torch.dtype):
+def normalize_quant_mode(raw: str | None) -> str:
+    mode = (raw or "none").strip().lower()
+    aliases = {
+        "": "none",
+        "none": "none",
+        "default": "none",
+        "fp": "none",
+        "fp16": "none",
+        "bf16": "none",
+        "float": "none",
+        "hf_int8": "bnb_8bit",
+        "int8": "bnb_8bit",
+        "bnb": "bnb_8bit",
+        "bnb_8bit": "bnb_8bit",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            f"unsupported quant_mode: {raw!r}. "
+            "supported: none, bnb_8bit (aliases: hf_int8, int8, bnb)"
+        )
+    return aliases[mode]
+
+
+def _load_bnb_8bit_model(model_dir: str, device: torch.device, dtype: torch.dtype):
+    if device.type != "cuda":
+        raise ValueError("bnb_8bit quantization requires CUDA device")
+    try:
+        from transformers import BitsAndBytesConfig
+    except Exception as exc:
+        raise ModuleNotFoundError(
+            "bitsandbytes is required for bnb_8bit quantization."
+        ) from exc
+
+    quant_cfg = BitsAndBytesConfig(load_in_8bit=True)
+    m = AutoModelForCausalLM.from_pretrained(
+        model_dir,
+        torch_dtype=dtype,
+        quantization_config=quant_cfg,
+        device_map={"": str(device)},
+    )
+    m.eval()
+    return m
+
+
+def load_front_model(
+    front_dir: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    quant_mode: str = "none",
+):
+    mode = normalize_quant_mode(quant_mode)
+    if mode == "bnb_8bit":
+        m = _load_bnb_8bit_model(front_dir, device, dtype)
+        try:
+            m.model.norm = nn.Identity()
+            m.lm_head = nn.Identity()
+        except Exception:
+            pass
+        m.eval()
+        return m
+
     cfg = AutoConfig.from_pretrained(front_dir)
     with init_empty_weights():
         m = AutoModelForCausalLM.from_config(cfg)
@@ -80,7 +140,22 @@ def load_front_model(front_dir: str, device: torch.device, dtype: torch.dtype):
     return m
 
 
-def load_back_model(back_dir: str, device: torch.device, dtype: torch.dtype):
+def load_back_model(
+    back_dir: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    quant_mode: str = "none",
+):
+    mode = normalize_quant_mode(quant_mode)
+    if mode == "bnb_8bit":
+        m = _load_bnb_8bit_model(back_dir, device, dtype)
+        try:
+            m.model.embed_tokens = nn.Identity()
+        except Exception:
+            pass
+        m.eval()
+        return m
+
     cfg = AutoConfig.from_pretrained(back_dir)
     with init_empty_weights():
         m = AutoModelForCausalLM.from_config(cfg)
@@ -238,6 +313,7 @@ __all__ = [
     "RuntimeGenerateResult",
     "pick_device_and_dtype",
     "resolve_dir",
+    "normalize_quant_mode",
     "load_front_model",
     "load_back_model",
     "build_logits_processors",
