@@ -84,6 +84,7 @@ class TokenResponse(BaseModel):
     next_token_id: int
     seq_len: int
     server_ms: float
+    codec_decode_ms: float = 0.0
 
 
 @dataclass
@@ -211,7 +212,9 @@ class RemoteBackServer:
                     step=0,
                     extras=dict(req.codec_extras or {}),
                 )
+                t_codec0 = time.perf_counter()
                 hidden = self._payload_to_hidden(req.hidden, context=prefill_ctx)
+                codec_decode_ms = (time.perf_counter() - t_codec0) * 1000.0
                 if hidden.ndim != 3:
                     raise HTTPException(status_code=400, detail="hidden must be [B, T, H]")
 
@@ -292,6 +295,7 @@ class RemoteBackServer:
                     next_token_id=next_token_id,
                     seq_len=seq,
                     server_ms=(t1 - t0) * 1000.0,
+                    codec_decode_ms=codec_decode_ms,
                 )
             except HTTPException:
                 if not session_registered:
@@ -331,10 +335,12 @@ class RemoteBackServer:
                 extras=dict(req.codec_extras or {}),
             )
             try:
+                t_codec0 = time.perf_counter()
                 hidden_last = self._payload_to_hidden(
                     req.hidden_last,
                     context=decode_ctx,
                 )
+                codec_decode_ms = (time.perf_counter() - t_codec0) * 1000.0
             except Exception as exc:
                 raise HTTPException(
                     status_code=400,
@@ -391,6 +397,7 @@ class RemoteBackServer:
                 next_token_id=next_token_id,
                 seq_len=st.seq_len,
                 server_ms=(t1 - t0) * 1000.0,
+                codec_decode_ms=codec_decode_ms,
             )
 
     def run(self, host: str = "0.0.0.0", port: int = 8000, log_level: str = "info"):

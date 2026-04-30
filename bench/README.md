@@ -103,6 +103,9 @@ python3 -m bench.generate_jsonl \
 - `--codec` custom module forms: `custom.my_codec`, `custom.my_codec:build_codec`, `custom.registry.my_codec`.
 - `ppl.py` and `mmlu.py` are local-only; `latency.py` supports `local_split` and `remote_back`.
 - `latency.py --runtime_mode remote_back` requires a running server (`python3 -m runtime.server ...`).
+- In `latency.py`, `ttft_ms`, `system_latency_ms`, and `decode_step_latency_ms` are end-to-end in both local and remote modes.
+- Remote latency also reports HTTP RTT and server compute time under `eval.remote`.
+- Remote codec metrics include client-side codec encode time, server-side codec decode time, and hidden-payload wire bytes. Local codec metrics measure the same split boundary inside one process.
 - `mmlu.py` now uses a two-stage flow: prepare prompt JSONL -> generate with `generate_jsonl_with_model` -> score by single-letter parse. It supports `--decoding` (`greedy`, `top_k`, `top_p`) and related generation args.
 - `generate_jsonl.py` is the direct CLI wrapper for line-by-line JSONL generation; output rows are written incrementally and reordered by index at the end to match input order.
 - `generate_jsonl_with_model` is suitable for generation-first benchmarks (current fit: `mmlu.py`). It is not used in `ppl.py` (forward NLL) or `latency.py` (TTFT/transport latency metrics) because those require different measurement paths.

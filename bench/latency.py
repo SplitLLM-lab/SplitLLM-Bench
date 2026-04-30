@@ -45,6 +45,10 @@ class SampleMetric:
     finish_reason: str
     decode_step_ms: list[float] = field(default_factory=list)
     codec_rounds: list[CodecRoundMetric] = field(default_factory=list)
+    remote_prefill_rtt_ms: float = 0.0
+    remote_decode_rtt_ms: list[float] = field(default_factory=list)
+    remote_prefill_server_ms: float = 0.0
+    remote_decode_server_ms: list[float] = field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
@@ -263,6 +267,7 @@ def run_one_sample(
     finish_reason = "length"
 
     ttft_ms = 0.0
+    total_ms = 0.0
     t_total0 = time.perf_counter()
     all_ids = input_ids
 
@@ -384,16 +389,16 @@ def run_one_sample(
                 all_ids = torch.cat([all_ids, next_token], dim=1)
                 if generated_ids[-1] in stop_token_ids:
                     finish_reason = "stop"
+            total_ms = (time.perf_counter() - t_total0) * 1000.0
     finally:
         try:
             codec.end_session(session_id)
         except Exception:
             pass
 
-    t_total1 = time.perf_counter()
     return SampleMetric(
         ttft_ms=float(ttft_ms),
-        total_ms=float((t_total1 - t_total0) * 1000.0),
+        total_ms=float(total_ms),
         prompt_tokens=prompt_len,
         generated_tokens=len(generated_ids),
         finish_reason=finish_reason,
@@ -424,14 +429,54 @@ def run_one_sample_remote(
         sampling=sampling,
         codec_extras=codec_extras,
     )
+    codec_rounds: list[CodecRoundMetric] = []
+    if result.generated_token_ids:
+        codec_rounds.append(
+            CodecRoundMetric(
+                phase="prefill",
+                encode_ms=float(result.prefill_codec_encode_ms),
+                decode_ms=float(result.prefill_codec_decode_ms),
+                wire_bytes=int(result.prefill_codec_wire_bytes),
+            )
+        )
+    decode_codec_rounds = max(
+        len(result.decode_codec_encode_ms),
+        len(result.decode_codec_decode_ms),
+        len(result.decode_codec_wire_bytes),
+    )
+    for i in range(decode_codec_rounds):
+        codec_rounds.append(
+            CodecRoundMetric(
+                phase="decode",
+                encode_ms=(
+                    float(result.decode_codec_encode_ms[i])
+                    if i < len(result.decode_codec_encode_ms)
+                    else 0.0
+                ),
+                decode_ms=(
+                    float(result.decode_codec_decode_ms[i])
+                    if i < len(result.decode_codec_decode_ms)
+                    else 0.0
+                ),
+                wire_bytes=(
+                    int(result.decode_codec_wire_bytes[i])
+                    if i < len(result.decode_codec_wire_bytes)
+                    else 0
+                ),
+            )
+        )
     return SampleMetric(
         ttft_ms=float(result.ttft_ms),
         total_ms=float(result.total_ms),
         prompt_tokens=prompt_len,
         generated_tokens=len(result.generated_token_ids),
         finish_reason=result.finish_reason,
-        decode_step_ms=[float(x) for x in result.per_token_rtt_ms],
-        codec_rounds=[],
+        decode_step_ms=[float(x) for x in result.decode_step_ms],
+        codec_rounds=codec_rounds,
+        remote_prefill_rtt_ms=float(result.prefill_rtt_ms),
+        remote_decode_rtt_ms=[float(x) for x in result.decode_rtt_ms],
+        remote_prefill_server_ms=float(result.prefill_server_ms),
+        remote_decode_server_ms=[float(x) for x in result.decode_server_ms],
     )
 
 
@@ -502,7 +547,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             f"[info] remote server={args.server_url}, timeout_sec={float(args.timeout_sec):.1f}"
         )
         print(
-            "[warn] codec roundtrip metrics are local-only; remote_back codec fields report 0"
+            "[info] remote_back TTFT/decode steps are end-to-end; HTTP RTT/server_ms are reported separately"
         )
     print(f"[info] loaded {n} samples from {args.dataset_name}/{args.dataset_config}:{args.split}")
     print(f"[info] max_prompt_length={args.max_prompt_length}, max_new_tokens={args.max_new_tokens}")
@@ -520,6 +565,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     decode_decode_ms_all: list[float] = []
     prefill_wire_bytes_all: list[int] = []
     decode_wire_bytes_all: list[int] = []
+    remote_prefill_rtt_ms_all: list[float] = []
+    remote_decode_rtt_ms_all: list[float] = []
+    remote_prefill_server_ms_all: list[float] = []
+    remote_decode_server_ms_all: list[float] = []
     finish_reason_count: dict[str, int] = {}
 
     t_bench0 = time.perf_counter()
@@ -566,6 +615,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         prompt_tokens_all.append(metric.prompt_tokens)
         generated_tokens_all.append(metric.generated_tokens)
         decode_step_ms_all.extend(metric.decode_step_ms)
+        if is_remote:
+            remote_prefill_rtt_ms_all.append(metric.remote_prefill_rtt_ms)
+            remote_decode_rtt_ms_all.extend(metric.remote_decode_rtt_ms)
+            remote_prefill_server_ms_all.append(metric.remote_prefill_server_ms)
+            remote_decode_server_ms_all.extend(metric.remote_decode_server_ms)
         finish_reason_count[metric.finish_reason] = (
             finish_reason_count.get(metric.finish_reason, 0) + 1
         )
@@ -680,6 +734,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     "total": int(total_decode_wire),
                     "avg_per_round": float(mean(decode_wire_bytes_all)),
                     "max_per_round": float(max_or_zero(decode_wire_bytes_all)),
+                },
+            },
+            "remote": {
+                "rtt_ms": {
+                    "prefill": stat_block(remote_prefill_rtt_ms_all),
+                    "decode": stat_block(remote_decode_rtt_ms_all),
+                },
+                "server_ms": {
+                    "prefill": stat_block(remote_prefill_server_ms_all),
+                    "decode": stat_block(remote_decode_server_ms_all),
                 },
             },
         },

@@ -16,6 +16,7 @@ ckpt_snap/
 bench/results/
 viz_out/
 test.py
+my_methods/
 
 # Distribution / packaging
 .Python

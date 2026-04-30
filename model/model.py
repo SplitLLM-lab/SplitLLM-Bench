@@ -220,7 +220,12 @@ class SplitLLMModel:
 
         timing = {
             "ttft_ms": runtime_result.ttft_ms,
+            "decode_step_ms": runtime_result.decode_step_ms,
             "per_token_rtt_ms": runtime_result.per_token_rtt_ms,
+            "prefill_rtt_ms": runtime_result.prefill_rtt_ms,
+            "decode_rtt_ms": runtime_result.decode_rtt_ms,
+            "prefill_server_ms": runtime_result.prefill_server_ms,
+            "decode_server_ms": runtime_result.decode_server_ms,
             "server_ms": runtime_result.server_ms,
             "total_ms": runtime_result.total_ms,
             "tokens_generated": len(generated),

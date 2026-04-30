@@ -215,8 +215,19 @@ class RuntimeGenerateResult:
     generated_token_ids: list[int]
     finish_reason: str
     ttft_ms: float
+    decode_step_ms: list[float] = field(default_factory=list)
     per_token_rtt_ms: list[float] = field(default_factory=list)
+    prefill_rtt_ms: float = 0.0
+    decode_rtt_ms: list[float] = field(default_factory=list)
+    prefill_server_ms: float = 0.0
+    decode_server_ms: list[float] = field(default_factory=list)
     server_ms: list[float] = field(default_factory=list)
+    prefill_codec_encode_ms: float = 0.0
+    prefill_codec_decode_ms: float = 0.0
+    prefill_codec_wire_bytes: int = 0
+    decode_codec_encode_ms: list[float] = field(default_factory=list)
+    decode_codec_decode_ms: list[float] = field(default_factory=list)
+    decode_codec_wire_bytes: list[int] = field(default_factory=list)
     total_ms: float = 0.0
 
 

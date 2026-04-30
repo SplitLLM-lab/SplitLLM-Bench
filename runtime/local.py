@@ -208,6 +208,7 @@ class LocalSplitRuntime:
             generated_token_ids=generated_ids,
             finish_reason=finish_reason,
             ttft_ms=(t_prefill1 - t_prefill0) * 1000.0,
+            decode_step_ms=per_token_rtt_ms,
             per_token_rtt_ms=per_token_rtt_ms,
             total_ms=(t_total1 - t_total0) * 1000.0,
         )

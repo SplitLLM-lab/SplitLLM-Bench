@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,6 +28,14 @@ class RemoteTokenResponse:
     seq_len: int
     server_ms: float
     rtt_ms: float
+    codec_encode_ms: float = 0.0
+    codec_decode_ms: float = 0.0
+    wire_bytes: int = 0
+
+
+def payload_size_bytes(payload: dict[str, Any]) -> int:
+    wire_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return len(wire_json.encode("utf-8"))
 
 
 class RemoteBackClient:
@@ -71,10 +80,13 @@ class RemoteBackClient:
             step=0,
             extras=dict(codec_extras or {}),
         )
+        t_codec0 = time.perf_counter()
         encoded = self.codec.encode(hidden, context=context)
+        codec_encode_ms = (time.perf_counter() - t_codec0) * 1000.0
+        hidden_payload = encoded_to_payload(self.codec, encoded)
         payload = {
             "session_id": session_id,
-            "hidden": encoded_to_payload(self.codec, encoded),
+            "hidden": hidden_payload,
             "attention_mask": attention_mask[0].detach().to(torch.long).cpu().tolist(),
             "prompt_token_ids": prompt_token_ids,
             "codec_extras": context.extras,
@@ -90,6 +102,7 @@ class RemoteBackClient:
                 "eos_token_id": eos_token_id,
             },
         }
+        wire_bytes = payload_size_bytes(hidden_payload)
 
         t0 = time.perf_counter()
         r = requests.post(
@@ -107,6 +120,9 @@ class RemoteBackClient:
             seq_len=int(resp["seq_len"]),
             server_ms=float(resp["server_ms"]),
             rtt_ms=(t1 - t0) * 1000.0,
+            codec_encode_ms=float(codec_encode_ms),
+            codec_decode_ms=float(resp.get("codec_decode_ms", 0.0)),
+            wire_bytes=int(wire_bytes),
         )
 
     def decode(
@@ -126,14 +142,18 @@ class RemoteBackClient:
             step=token_step,
             extras=dict(codec_extras or {}),
         )
+        t_codec0 = time.perf_counter()
         encoded = self.codec.encode(hidden_last, context=context)
+        codec_encode_ms = (time.perf_counter() - t_codec0) * 1000.0
+        hidden_payload = encoded_to_payload(self.codec, encoded)
         payload = {
             "session_id": session_id,
-            "hidden_last": encoded_to_payload(self.codec, encoded),
+            "hidden_last": hidden_payload,
             "seq_len": int(seq_len),
             "token_step": int(token_step),
             "codec_extras": context.extras,
         }
+        wire_bytes = payload_size_bytes(hidden_payload)
 
         t0 = time.perf_counter()
         r = requests.post(
@@ -151,6 +171,9 @@ class RemoteBackClient:
             seq_len=int(resp["seq_len"]),
             server_ms=float(resp["server_ms"]),
             rtt_ms=(t1 - t0) * 1000.0,
+            codec_encode_ms=float(codec_encode_ms),
+            codec_decode_ms=float(resp.get("codec_decode_ms", 0.0)),
+            wire_bytes=int(wire_bytes),
         )
 
 
@@ -217,6 +240,7 @@ class RemoteSplitRuntime:
         front_cache = DynamicCache()
         cache_position = torch.arange(0, prompt_len, device=self.device)
 
+        t_prefill0 = time.perf_counter()
         out_front = self.front.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -231,8 +255,18 @@ class RemoteSplitRuntime:
         codec_extras = dict(codec_extras or {})
         generated_ids: list[int] = []
         ttft_ms = 0.0
-        per_token_rtt_ms: list[float] = []
-        server_ms: list[float] = []
+        total_ms = 0.0
+        decode_step_ms: list[float] = []
+        decode_rtt_ms: list[float] = []
+        decode_server_ms: list[float] = []
+        decode_codec_encode_ms: list[float] = []
+        decode_codec_decode_ms: list[float] = []
+        decode_codec_wire_bytes: list[int] = []
+        prefill_rtt_ms = 0.0
+        prefill_server_ms = 0.0
+        prefill_codec_encode_ms = 0.0
+        prefill_codec_decode_ms = 0.0
+        prefill_codec_wire_bytes = 0
         finish_reason = "length"
 
         try:
@@ -246,12 +280,17 @@ class RemoteSplitRuntime:
                 eos_token_id=eos_token_id,
                 codec_extras=codec_extras,
             )
+            t_prefill1 = time.perf_counter()
             session_id = prefill_resp.session_id
 
             next_token_id = int(prefill_resp.next_token_id)
-            ttft_ms = prefill_resp.rtt_ms
+            ttft_ms = (t_prefill1 - t_prefill0) * 1000.0
+            prefill_rtt_ms = prefill_resp.rtt_ms
+            prefill_server_ms = prefill_resp.server_ms
+            prefill_codec_encode_ms = prefill_resp.codec_encode_ms
+            prefill_codec_decode_ms = prefill_resp.codec_decode_ms
+            prefill_codec_wire_bytes = prefill_resp.wire_bytes
             generated_ids.append(next_token_id)
-            server_ms.append(prefill_resp.server_ms)
 
             if next_token_id in stop_token_ids:
                 finish_reason = "stop"
@@ -263,6 +302,7 @@ class RemoteSplitRuntime:
                 if finish_reason == "stop":
                     break
 
+                t_step0 = time.perf_counter()
                 cache_position = cache_position[-1:] + 1
                 seq_len += 1
 
@@ -284,13 +324,20 @@ class RemoteSplitRuntime:
                 )
                 next_token_id = int(decode_resp.next_token_id)
                 next_token = torch.tensor([[next_token_id]], device=self.device)
+                t_step1 = time.perf_counter()
 
                 generated_ids.append(next_token_id)
-                per_token_rtt_ms.append(decode_resp.rtt_ms)
-                server_ms.append(decode_resp.server_ms)
+                decode_step_ms.append((t_step1 - t_step0) * 1000.0)
+                decode_rtt_ms.append(decode_resp.rtt_ms)
+                decode_server_ms.append(decode_resp.server_ms)
+                decode_codec_encode_ms.append(decode_resp.codec_encode_ms)
+                decode_codec_decode_ms.append(decode_resp.codec_decode_ms)
+                decode_codec_wire_bytes.append(decode_resp.wire_bytes)
 
                 if next_token_id in stop_token_ids:
                     finish_reason = "stop"
+
+            total_ms = (time.perf_counter() - t_total0) * 1000.0
 
         finally:
             if session_id:
@@ -303,15 +350,25 @@ class RemoteSplitRuntime:
                 except Exception:
                     pass
 
-        t_total1 = time.perf_counter()
         return RuntimeGenerateResult(
             prompt_token_ids=input_ids[0].detach().cpu().tolist(),
             generated_token_ids=generated_ids,
             finish_reason=finish_reason,
             ttft_ms=ttft_ms,
-            per_token_rtt_ms=per_token_rtt_ms,
-            server_ms=server_ms,
-            total_ms=(t_total1 - t_total0) * 1000.0,
+            decode_step_ms=decode_step_ms,
+            per_token_rtt_ms=decode_rtt_ms,
+            prefill_rtt_ms=prefill_rtt_ms,
+            decode_rtt_ms=decode_rtt_ms,
+            prefill_server_ms=prefill_server_ms,
+            decode_server_ms=decode_server_ms,
+            server_ms=[prefill_server_ms] + decode_server_ms,
+            prefill_codec_encode_ms=prefill_codec_encode_ms,
+            prefill_codec_decode_ms=prefill_codec_decode_ms,
+            prefill_codec_wire_bytes=prefill_codec_wire_bytes,
+            decode_codec_encode_ms=decode_codec_encode_ms,
+            decode_codec_decode_ms=decode_codec_decode_ms,
+            decode_codec_wire_bytes=decode_codec_wire_bytes,
+            total_ms=total_ms,
         )
 
 
