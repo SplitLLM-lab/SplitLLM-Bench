@@ -13,6 +13,7 @@ Benchmark scripts for split inference quality and latency.
 - `bench/ppl.py`: PPL benchmark (local split runtime)
 - `bench/mmlu.py`: MMLU multiple-choice accuracy benchmark (local split runtime)
 - `bench/latency.py`: latency benchmark (local split or remote back)
+- `bench/scenario.py`: YAML scenario benchmark with local latency measurement, post-hoc network simulation, PPL, MMLU, and timeline plot
 - `bench/generate_jsonl.py`: generic JSONL generation CLI (local split runtime)
 - `bench/utils.py`: shared helpers (codec loading, dataset loading, math)
 
@@ -79,6 +80,67 @@ python3 -m bench.mmlu \
   --codec default
 ```
 
+Scenario benchmark (local split + post-hoc network simulation):
+
+```yaml
+scenario:
+  name: mobile_agent_typical_5g
+  description: "Mobile tool-using agent over typical 5G uplink"
+
+network:
+  uplink_mbps:
+    mean: 15
+    jitter: 0.25
+    min: 5
+    max: 30
+  downlink_mbps:
+    mean: 80
+    jitter: 0.20
+  rtt_ms:
+    mean: 55
+    jitter: 15
+    burst_probability: 0.03
+    burst_extra_ms:
+      min: 50
+      max: 250
+  packet_loss: 0.0
+  seed: 42
+
+workload:
+  type: agent
+  dataset:
+    name: wikitext
+    config: wikitext-2-raw-v1
+    split: test
+  prompt_tokens:
+    target: 256
+    tolerance: 64
+  max_new_tokens: 32
+  stop_at_eos: false
+  generation:
+    decoding: greedy
+    temperature: 0.0
+
+targets:
+  ttft_s: 3.0
+  e2e_s: 30.0
+  mean_itl_ms: 200
+  atat_s: 15.0
+```
+
+```bash
+source ~/b2gan/.venv/bin/activate
+python3 -m bench.scenario \
+  --scenario ./bench/mobile_agent_typical_5g.yaml \
+  --front_dir ./split_out/front \
+  --back_dir ./split_out/back \
+  --tokenizer_id Qwen/Qwen3-1.7B \
+  --samples 16 \
+  --skip_ppl \
+  --skip_mmlu \
+  --out_dir ./bench_out/mobile_agent_typical_5g
+```
+
 Direct JSONL generation (local split):
 
 ```bash
@@ -102,6 +164,10 @@ python3 -m bench.generate_jsonl \
 - `--codec` supports builtin codecs (`default`, `identity_fp32`).
 - `--codec` custom module forms: `custom.my_codec`, `custom.my_codec:build_codec`, `custom.registry.my_codec`.
 - `ppl.py` and `mmlu.py` are local-only; `latency.py` supports `local_split` and `remote_back`.
+- `scenario.py` is local-only in v1. It measures local split compute and codec transfer bytes, then simulates the configured network post-hoc without sleeping.
+- `scenario.py` writes `scenario_result.json`, `timeline.csv`, and `timeline.png` under `--out_dir`.
+- Scenario prompt columns are auto-detected from `prompt`, `question`, `text`, `input`, or `query`; set `workload.prompt_column` when needed.
+- Scenario PPL defaults to Wikitext and MMLU defaults to `cais/mmlu`; override them with optional `quality.ppl` and `quality.mmlu` sections in the YAML, or skip with `--skip_ppl` / `--skip_mmlu`.
 - `latency.py --runtime_mode remote_back` requires a running server (`python3 -m runtime.server ...`).
 - In `latency.py`, `ttft_ms`, `system_latency_ms`, and `decode_step_latency_ms` are end-to-end in both local and remote modes.
 - Remote latency also reports HTTP RTT and server compute time under `eval.remote`.
