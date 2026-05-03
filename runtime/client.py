@@ -51,7 +51,12 @@ def parse_args() -> argparse.Namespace:
         default="autoregressive",
         choices=["autoregressive", "self_speculative"],
     )
-    p.add_argument("--assistant_early_exit", type=int, default=None)
+    p.add_argument(
+        "--assistant_early_exit",
+        type=int,
+        default=None,
+        help="Optional self-spec override; default uses all front layers.",
+    )
     p.add_argument("--num_speculations", type=int, default=3)
     p.add_argument("--do_sample", action="store_true")
     p.add_argument("--temperature", type=float, default=1.0)
@@ -79,11 +84,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     codec = build_codec(args.codec)
     codec_extras = parse_codec_extras(args.codec_extras_json)
     prompt = resolve_prompt(args.prompt, args.prompt_file)
-    if str(args.generation_mode) == "self_speculative" and args.assistant_early_exit is None:
-        raise ValueError(
-            "self_speculative generation requires --assistant_early_exit "
-            "(for LayerSkip Llama3 8B, try 4)"
-        )
+    self_speculative = str(args.generation_mode) == "self_speculative"
 
     print("[info] building remote client model")
     model = SplitLLMModel.from_pretrained(
@@ -97,7 +98,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         timeout_sec=float(args.timeout_sec),
         revision=args.revision,
         codec=codec,
-        enable_self_speculative=str(args.generation_mode) == "self_speculative",
+        enable_self_speculative=self_speculative,
     )
 
     print(
@@ -115,9 +116,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         no_repeat_ngram_size=int(args.no_repeat_ngram_size),
         repetition_penalty=float(args.repetition_penalty),
         codec_extras=codec_extras,
+        self_speculative=self_speculative,
         assistant_early_exit=(
             int(args.assistant_early_exit)
-            if str(args.generation_mode) == "self_speculative"
+            if self_speculative and args.assistant_early_exit is not None
             else None
         ),
         num_speculations=int(args.num_speculations),

@@ -123,6 +123,19 @@ def parse_args() -> argparse.Namespace:
         choices=["greedy", "top_k", "top_p"],
     )
     p.add_argument("--max_new_tokens", type=int, default=1)
+    p.add_argument(
+        "--generation_mode",
+        type=str,
+        default="autoregressive",
+        choices=["autoregressive", "self_speculative"],
+    )
+    p.add_argument(
+        "--assistant_early_exit",
+        type=int,
+        default=None,
+        help="Optional self-spec override; default uses all front layers.",
+    )
+    p.add_argument("--num_speculations", type=int, default=3)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--top_p", type=float, default=0.9)
@@ -445,6 +458,18 @@ def mean(xs: list[float]) -> float:
     return float(sum(xs) / len(xs))
 
 
+def effective_front_early_exit_layers(
+    runtime: LocalSplitRuntime,
+    self_speculative: bool,
+    assistant_early_exit: int | None,
+) -> int | None:
+    if not self_speculative and assistant_early_exit is None:
+        return None
+    if assistant_early_exit is not None:
+        return int(assistant_early_exit)
+    return int(runtime.front.model.config.num_hidden_layers)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
@@ -454,6 +479,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     subject_filter = parse_subjects(args.subjects)
     codec_extras = parse_codec_extras(args.codec_extras_json)
     codec = build_codec(args.codec)
+    self_speculative = str(args.generation_mode) == "self_speculative"
 
     runtime = LocalSplitRuntime(
         front_dir=args.front_dir,
@@ -464,8 +490,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         back_quant=args.back_quant,
         revision=args.revision,
         codec=codec,
+        enable_self_speculative=self_speculative,
     )
     codec = runtime.codec
+    assistant_early_exit = (
+        int(args.assistant_early_exit)
+        if self_speculative and args.assistant_early_exit is not None
+        else None
+    )
+    front_early_exit_layers = effective_front_early_exit_layers(
+        runtime=runtime,
+        self_speculative=self_speculative,
+        assistant_early_exit=assistant_early_exit,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_id,
@@ -532,8 +569,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[info] benchmark=mmlu mode=local_split codec={codec.name}")
     print(
         f"[info] device={runtime.device}, dtype={runtime.dtype}, "
-        f"decoding={args.decoding}, max_new_tokens={int(args.max_new_tokens)}"
+        f"decoding={args.decoding}, max_new_tokens={int(args.max_new_tokens)}, "
+        f"generation_mode={args.generation_mode}"
     )
+    if self_speculative:
+        print(
+            "[info] self_speculative "
+            f"front_early_exit_layers={front_early_exit_layers} "
+            f"assistant_early_exit_override={assistant_early_exit} "
+            f"num_speculations={int(args.num_speculations)}"
+        )
     print(
         "[info] dataset="
         f"{args.dataset_name}/{dataset_config if dataset_config is not None else '<none>'} "
@@ -590,6 +635,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             repetition_penalty=float(args.repetition_penalty),
         )
         generation_kwargs["codec_extras"] = codec_extras
+        generation_kwargs["self_speculative"] = self_speculative
+        generation_kwargs["assistant_early_exit"] = assistant_early_exit
+        generation_kwargs["num_speculations"] = int(args.num_speculations)
         generation_kwargs["use_chat_template"] = False
         generation_kwargs["add_generation_prompt"] = False
         generation_kwargs["skip_special_tokens"] = True
@@ -710,6 +758,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "n_shot_used_mean": float(mean(used_shots)),
             "max_length": int(args.max_length),
             "decoding": str(args.decoding),
+            "generation_mode": str(args.generation_mode),
+            "front_early_exit_layers": front_early_exit_layers,
+            "assistant_early_exit": assistant_early_exit,
+            "num_speculations": int(args.num_speculations),
             "max_new_tokens": int(args.max_new_tokens),
             "correct": int(correct),
             "accuracy": float(accuracy),

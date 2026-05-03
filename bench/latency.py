@@ -121,7 +121,12 @@ def parse_args() -> argparse.Namespace:
         default="autoregressive",
         choices=["autoregressive", "self_speculative"],
     )
-    p.add_argument("--assistant_early_exit", type=int, default=None)
+    p.add_argument(
+        "--assistant_early_exit",
+        type=int,
+        default=None,
+        help="Optional self-spec override; default uses all front layers.",
+    )
     p.add_argument("--num_speculations", type=int, default=3)
     p.add_argument("--do_sample", action="store_true")
     p.add_argument("--temperature", type=float, default=1.0)
@@ -164,6 +169,17 @@ def build_runtime(args: argparse.Namespace, codec: ActivationCodec) -> RuntimeTy
         codec=codec,
         enable_self_speculative=enable_self_speculative,
     )
+
+
+def effective_front_early_exit_layers(
+    runtime: RuntimeType,
+    sampling: SamplingConfig,
+) -> int | None:
+    if not (sampling.self_speculative or sampling.assistant_early_exit is not None):
+        return None
+    if sampling.assistant_early_exit is not None:
+        return int(sampling.assistant_early_exit)
+    return int(runtime.front.model.config.num_hidden_layers)
 
 
 def mean(xs: list[float]) -> float:
@@ -517,11 +533,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     codec_extras = parse_codec_extras(args.codec_extras_json)
     codec = build_codec(args.codec)
-    if str(args.generation_mode) == "self_speculative" and args.assistant_early_exit is None:
-        raise ValueError(
-            "self_speculative generation requires --assistant_early_exit "
-            "(for LayerSkip Llama3 8B, try 4)"
-        )
+    self_speculative = str(args.generation_mode) == "self_speculative"
 
     runtime = build_runtime(args, codec)
     codec = runtime.codec
@@ -567,14 +579,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         min_new_tokens=int(args.min_new_tokens),
         no_repeat_ngram_size=int(args.no_repeat_ngram_size),
         repetition_penalty=float(args.repetition_penalty),
+        self_speculative=self_speculative,
         assistant_early_exit=(
             int(args.assistant_early_exit)
-            if str(args.generation_mode) == "self_speculative"
+            if self_speculative and args.assistant_early_exit is not None
             else None
         ),
         num_speculations=int(args.num_speculations),
     )
     sampling.validate()
+    front_early_exit_layers = effective_front_early_exit_layers(runtime, sampling)
 
     amp_enabled = runtime.device.type == "cuda" and runtime.dtype in (
         torch.float16,
@@ -585,10 +599,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         f"[info] benchmark=latency mode={mode} codec={codec.name} "
         f"generation_mode={args.generation_mode}"
     )
-    if sampling.assistant_early_exit is not None:
+    if sampling.self_speculative or sampling.assistant_early_exit is not None:
         print(
             "[info] self_speculative "
-            f"assistant_early_exit={sampling.assistant_early_exit} "
+            f"front_early_exit_layers={front_early_exit_layers} "
+            f"assistant_early_exit_override={sampling.assistant_early_exit} "
             f"num_speculations={sampling.num_speculations}"
         )
     print(f"[info] device={runtime.device}, dtype={runtime.dtype}, autocast={amp_enabled}")
@@ -639,7 +654,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             runtime.device
         )
 
-        if sampling.assistant_early_exit is not None:
+        if sampling.self_speculative or sampling.assistant_early_exit is not None:
             metric = run_one_sample_runtime(
                 runtime=runtime,
                 input_ids=input_ids,
@@ -768,6 +783,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "max_prompt_length": int(args.max_prompt_length),
             "max_new_tokens": int(args.max_new_tokens),
             "generation_mode": str(args.generation_mode),
+            "front_early_exit_layers": front_early_exit_layers,
             "assistant_early_exit": sampling.assistant_early_exit,
             "num_speculations": int(sampling.num_speculations),
             "elapsed_sec": float(elapsed_sec),
@@ -779,7 +795,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "decode_steps_total": int(len(decode_step_ms_all)),
             "finish_reason_count": finish_reason_count,
             "self_speculative": {
-                "enabled": bool(sampling.assistant_early_exit is not None),
+                "enabled": bool(
+                    sampling.self_speculative
+                    or sampling.assistant_early_exit is not None
+                ),
+                "front_early_exit_layers": front_early_exit_layers,
+                "assistant_early_exit_override": sampling.assistant_early_exit,
                 "draft_tokens_total": int(total_draft_tokens),
                 "accepted_tokens_total": int(total_accepted_tokens),
                 "acceptance_rate": float(acceptance_rate),
@@ -857,7 +878,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "Codec encode/decode total (ms): "
         f"{total_encode_ms:.3f} / {total_decode_ms:.3f}"
     )
-    if sampling.assistant_early_exit is not None:
+    if sampling.self_speculative or sampling.assistant_early_exit is not None:
         print(
             "Self-spec draft/accepted/fallback: "
             f"{total_draft_tokens} / {total_accepted_tokens} / {sum(fallback_tokens_all)} "

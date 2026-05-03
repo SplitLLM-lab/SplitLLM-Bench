@@ -264,6 +264,7 @@ class SamplingConfig:
     no_repeat_ngram_size: int = 0
     repetition_penalty: float = 1.0
     bad_words_ids: Optional[list[list[int]]] = None
+    self_speculative: bool = False
     assistant_early_exit: Optional[int] = None
     num_speculations: int = 3
 
@@ -287,11 +288,14 @@ class SamplingConfig:
             raise ValueError(
                 f"repetition_penalty must be > 0, got {self.repetition_penalty}"
             )
-        if self.assistant_early_exit is not None:
-            if self.assistant_early_exit <= 0:
+        self_spec_enabled = bool(
+            self.self_speculative or self.assistant_early_exit is not None
+        )
+        if self_spec_enabled:
+            if self.assistant_early_exit is not None and self.assistant_early_exit <= 0:
                 raise ValueError(
-                    "assistant_early_exit must be > 0 when self-speculative "
-                    f"decoding is enabled, got {self.assistant_early_exit}"
+                    "assistant_early_exit must be > 0 when set, "
+                    f"got {self.assistant_early_exit}"
                 )
             if self.num_speculations <= 0:
                 raise ValueError(

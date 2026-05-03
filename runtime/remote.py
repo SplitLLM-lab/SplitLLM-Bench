@@ -439,7 +439,7 @@ class RemoteSplitRuntime:
         layers = getattr(self.front.model, "layers", None)
         if layers is not None and int(early_exit) > len(layers):
             raise ValueError(
-                f"assistant_early_exit ({early_exit}) exceeds front layers ({len(layers)})"
+                f"front early-exit layers ({early_exit}) exceeds front layers ({len(layers)})"
             )
 
     def _draft_logits(
@@ -492,7 +492,10 @@ class RemoteSplitRuntime:
         sampling: SamplingConfig,
         codec_extras: Optional[dict[str, Any]] = None,
     ) -> RuntimeGenerateResult:
-        early_exit = int(sampling.assistant_early_exit or 0)
+        early_exit = int(
+            sampling.assistant_early_exit
+            or self.front.model.config.num_hidden_layers
+        )
         self._ensure_self_speculative_ready(
             batch_size=int(input_ids.shape[0]),
             early_exit=early_exit,
@@ -787,7 +790,7 @@ class RemoteSplitRuntime:
                 ttft_ms=0.0,
                 total_ms=0.0,
             )
-        if sampling.assistant_early_exit is not None:
+        if sampling.self_speculative or sampling.assistant_early_exit is not None:
             return self._generate_self_speculative(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

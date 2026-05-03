@@ -157,6 +157,7 @@ class SplitLLMModel:
         bad_words_ids: Optional[list[list[int]]] = None,
         stop_token_ids: Optional[Sequence[int]] = None,
         codec_extras: Optional[dict[str, Any]] = None,
+        self_speculative: bool = False,
         assistant_early_exit: Optional[int] = None,
         num_speculations: int = 3,
         use_chat_template: bool = True,
@@ -191,6 +192,7 @@ class SplitLLMModel:
             no_repeat_ngram_size=no_repeat_ngram_size,
             repetition_penalty=repetition_penalty,
             bad_words_ids=bad_words_ids,
+            self_speculative=bool(self_speculative),
             assistant_early_exit=assistant_early_exit,
             num_speculations=int(num_speculations),
         )

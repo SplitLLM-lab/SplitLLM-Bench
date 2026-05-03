@@ -63,8 +63,8 @@ res = m.generate(prompt="Briefly compare TTFT and token RTT.", max_new_tokens=64
 print(res.text)
 ```
 
-Self-speculative generation uses the same API after loading the front with
-draft-head weights:
+Self-speculative generation uses the complete front as the early-exit draft
+model by default. The front checkpoint must include draft-head weights:
 
 ```python
 m = SplitLLMModel.from_pretrained(
@@ -78,10 +78,13 @@ m = SplitLLMModel.from_pretrained(
 res = m.generate(
     prompt="Explain LayerSkip briefly.",
     max_new_tokens=64,
-    assistant_early_exit=4,
+    self_speculative=True,
     num_speculations=3,
 )
 ```
+
+`assistant_early_exit` is optional and only overrides the number of front
+layers used for ablation runs.
 
 Run remote client generation (CLI):
 
@@ -104,3 +107,4 @@ python3 -m runtime.client \
 - `bnb_8bit` requires CUDA + `bitsandbytes`.
 - Local split runtime class is `runtime.local.LocalSplitRuntime` (no dedicated CLI entrypoint).
 - Self-speculative mode is greedy-only in this prototype and requires a front checkpoint split with `--front_draft_head`.
+- In `runtime.client`, use `--generation_mode self_speculative`; `--assistant_early_exit` is optional.

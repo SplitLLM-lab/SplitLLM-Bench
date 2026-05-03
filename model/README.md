@@ -51,7 +51,7 @@ m = SplitLLMModel.from_pretrained(
 res = m.generate(
     prompt="Explain LayerSkip briefly.",
     max_new_tokens=64,
-    assistant_early_exit=4,
+    self_speculative=True,
     num_speculations=3,
 )
 ```
@@ -59,7 +59,8 @@ res = m.generate(
 ## Notes
 
 - Modes: `local_split` and `remote_back`.
-- Self-speculative mode is greedy-only and requires a front checkpoint created with `split.ckpt --front_draft_head`.
+- Self-speculative mode is greedy-only, uses all front layers as the draft model by default, and requires a front checkpoint created with `split.ckpt --front_draft_head`.
+- `assistant_early_exit` is optional and only overrides the front layer count for ablation runs.
 - Default codec is `DefaultCodec` (local split avoids transport-style conversion by default).
 - You can pass custom codecs via `codec=...` (`ActivationCodec` or `FunctionalActivationCodec`).
 - Remote server/client setup and CLI examples are documented in `runtime/README.md`.
