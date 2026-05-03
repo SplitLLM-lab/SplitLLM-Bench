@@ -49,6 +49,11 @@ class SampleMetric:
     remote_decode_rtt_ms: list[float] = field(default_factory=list)
     remote_prefill_server_ms: float = 0.0
     remote_decode_server_ms: list[float] = field(default_factory=list)
+    self_speculative: bool = False
+    draft_tokens: int = 0
+    accepted_tokens: int = 0
+    verify_rounds: int = 0
+    fallback_tokens: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,6 +115,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_prompt_length", type=int, default=256)
 
     p.add_argument("--max_new_tokens", type=int, default=64)
+    p.add_argument(
+        "--generation_mode",
+        type=str,
+        default="autoregressive",
+        choices=["autoregressive", "self_speculative"],
+    )
+    p.add_argument("--assistant_early_exit", type=int, default=None)
+    p.add_argument("--num_speculations", type=int, default=3)
     p.add_argument("--do_sample", action="store_true")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=0)
@@ -125,6 +138,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_runtime(args: argparse.Namespace, codec: ActivationCodec) -> RuntimeType:
+    enable_self_speculative = str(args.generation_mode) == "self_speculative"
     if args.runtime_mode == "local_split":
         return LocalSplitRuntime(
             front_dir=args.front_dir,
@@ -135,6 +149,7 @@ def build_runtime(args: argparse.Namespace, codec: ActivationCodec) -> RuntimeTy
             back_quant=args.back_quant,
             revision=args.revision,
             codec=codec,
+            enable_self_speculative=enable_self_speculative,
         )
     if not args.server_url:
         raise ValueError("remote_back mode requires --server_url")
@@ -147,6 +162,7 @@ def build_runtime(args: argparse.Namespace, codec: ActivationCodec) -> RuntimeTy
         timeout_sec=float(args.timeout_sec),
         revision=args.revision,
         codec=codec,
+        enable_self_speculative=enable_self_speculative,
     )
 
 
@@ -408,27 +424,11 @@ def run_one_sample(
 
 
 @torch.no_grad()
-def run_one_sample_remote(
+def metric_from_runtime_result(
     *,
-    runtime: RemoteSplitRuntime,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    eos_token_id: int | None,
-    stop_token_ids: set[int],
-    sampling: SamplingConfig,
-    max_new_tokens: int,
-    codec_extras: dict[str, Any],
+    result,
+    prompt_len: int,
 ) -> SampleMetric:
-    prompt_len = int(input_ids.shape[1])
-    result = runtime.generate_from_ids(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=eos_token_id,
-        stop_token_ids=stop_token_ids,
-        sampling=sampling,
-        codec_extras=codec_extras,
-    )
     codec_rounds: list[CodecRoundMetric] = []
     if result.generated_token_ids:
         codec_rounds.append(
@@ -477,7 +477,37 @@ def run_one_sample_remote(
         remote_decode_rtt_ms=[float(x) for x in result.decode_rtt_ms],
         remote_prefill_server_ms=float(result.prefill_server_ms),
         remote_decode_server_ms=[float(x) for x in result.decode_server_ms],
+        self_speculative=bool(result.self_speculative),
+        draft_tokens=int(result.draft_tokens),
+        accepted_tokens=int(result.accepted_tokens),
+        verify_rounds=int(result.verify_rounds),
+        fallback_tokens=int(result.fallback_tokens),
     )
+
+
+@torch.no_grad()
+def run_one_sample_runtime(
+    *,
+    runtime: RuntimeType,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    eos_token_id: int | None,
+    stop_token_ids: set[int],
+    sampling: SamplingConfig,
+    max_new_tokens: int,
+    codec_extras: dict[str, Any],
+) -> SampleMetric:
+    prompt_len = int(input_ids.shape[1])
+    result = runtime.generate_from_ids(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=eos_token_id,
+        stop_token_ids=stop_token_ids,
+        sampling=sampling,
+        codec_extras=codec_extras,
+    )
+    return metric_from_runtime_result(result=result, prompt_len=prompt_len)
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
@@ -487,6 +517,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     codec_extras = parse_codec_extras(args.codec_extras_json)
     codec = build_codec(args.codec)
+    if str(args.generation_mode) == "self_speculative" and args.assistant_early_exit is None:
+        raise ValueError(
+            "self_speculative generation requires --assistant_early_exit "
+            "(for LayerSkip Llama3 8B, try 4)"
+        )
 
     runtime = build_runtime(args, codec)
     codec = runtime.codec
@@ -532,6 +567,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         min_new_tokens=int(args.min_new_tokens),
         no_repeat_ngram_size=int(args.no_repeat_ngram_size),
         repetition_penalty=float(args.repetition_penalty),
+        assistant_early_exit=(
+            int(args.assistant_early_exit)
+            if str(args.generation_mode) == "self_speculative"
+            else None
+        ),
+        num_speculations=int(args.num_speculations),
     )
     sampling.validate()
 
@@ -540,7 +581,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         torch.bfloat16,
     )
 
-    print(f"[info] benchmark=latency mode={mode} codec={codec.name}")
+    print(
+        f"[info] benchmark=latency mode={mode} codec={codec.name} "
+        f"generation_mode={args.generation_mode}"
+    )
+    if sampling.assistant_early_exit is not None:
+        print(
+            "[info] self_speculative "
+            f"assistant_early_exit={sampling.assistant_early_exit} "
+            f"num_speculations={sampling.num_speculations}"
+        )
     print(f"[info] device={runtime.device}, dtype={runtime.dtype}, autocast={amp_enabled}")
     if is_remote:
         print(
@@ -570,6 +620,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     remote_prefill_server_ms_all: list[float] = []
     remote_decode_server_ms_all: list[float] = []
     finish_reason_count: dict[str, int] = {}
+    draft_tokens_all: list[int] = []
+    accepted_tokens_all: list[int] = []
+    verify_rounds_all: list[int] = []
+    fallback_tokens_all: list[int] = []
 
     t_bench0 = time.perf_counter()
 
@@ -585,8 +639,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             runtime.device
         )
 
-        if is_remote:
-            metric = run_one_sample_remote(
+        if sampling.assistant_early_exit is not None:
+            metric = run_one_sample_runtime(
+                runtime=runtime,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                eos_token_id=eos_token_id,
+                stop_token_ids=stop_token_ids,
+                sampling=sampling,
+                max_new_tokens=int(args.max_new_tokens),
+                codec_extras=codec_extras,
+            )
+        elif is_remote:
+            metric = run_one_sample_runtime(
                 runtime=runtime,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -623,6 +688,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         finish_reason_count[metric.finish_reason] = (
             finish_reason_count.get(metric.finish_reason, 0) + 1
         )
+        draft_tokens_all.append(int(metric.draft_tokens))
+        accepted_tokens_all.append(int(metric.accepted_tokens))
+        verify_rounds_all.append(int(metric.verify_rounds))
+        fallback_tokens_all.append(int(metric.fallback_tokens))
 
         for round_metric in metric.codec_rounds:
             if round_metric.phase == "prefill":
@@ -657,6 +726,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     )
     total_prefill_wire = int(sum(prefill_wire_bytes_all))
     total_decode_wire = int(sum(decode_wire_bytes_all))
+    total_draft_tokens = int(sum(draft_tokens_all))
+    total_accepted_tokens = int(sum(accepted_tokens_all))
+    acceptance_rate = (
+        float(total_accepted_tokens / total_draft_tokens)
+        if total_draft_tokens > 0
+        else 0.0
+    )
 
     result: Dict[str, Any] = {
         "benchmark": {
@@ -691,6 +767,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "samples": int(n),
             "max_prompt_length": int(args.max_prompt_length),
             "max_new_tokens": int(args.max_new_tokens),
+            "generation_mode": str(args.generation_mode),
+            "assistant_early_exit": sampling.assistant_early_exit,
+            "num_speculations": int(sampling.num_speculations),
             "elapsed_sec": float(elapsed_sec),
             "samples_per_sec": float(samples_per_sec),
             "generated_tokens_total": int(total_generated_tokens),
@@ -699,6 +778,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "prompt_tokens_total": int(sum(prompt_tokens_all)),
             "decode_steps_total": int(len(decode_step_ms_all)),
             "finish_reason_count": finish_reason_count,
+            "self_speculative": {
+                "enabled": bool(sampling.assistant_early_exit is not None),
+                "draft_tokens_total": int(total_draft_tokens),
+                "accepted_tokens_total": int(total_accepted_tokens),
+                "acceptance_rate": float(acceptance_rate),
+                "verify_rounds_total": int(sum(verify_rounds_all)),
+                "fallback_tokens_total": int(sum(fallback_tokens_all)),
+            },
             "ttft_ms": stat_block(ttft_ms_all),
             "system_latency_ms": stat_block(total_ms_all),
             "decode_step_latency_ms": stat_block(decode_step_ms_all),
@@ -770,6 +857,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "Codec encode/decode total (ms): "
         f"{total_encode_ms:.3f} / {total_decode_ms:.3f}"
     )
+    if sampling.assistant_early_exit is not None:
+        print(
+            "Self-spec draft/accepted/fallback: "
+            f"{total_draft_tokens} / {total_accepted_tokens} / {sum(fallback_tokens_all)} "
+            f"(acceptance={acceptance_rate:.3f})"
+        )
 
     if args.out_json:
         out_path = Path(args.out_json).expanduser()

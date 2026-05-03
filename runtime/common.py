@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -102,15 +103,80 @@ def _load_bnb_8bit_model(model_dir: str, device: torch.device, dtype: torch.dtyp
     return m
 
 
+def checkpoint_has_draft_head(model_dir: str) -> bool:
+    root = Path(model_dir)
+    if not root.is_dir():
+        return False
+
+    wanted = ("model.norm.", "lm_head.")
+    try:
+        from safetensors import safe_open
+    except ModuleNotFoundError:
+        return False
+
+    shards = sorted(root.glob("*.safetensors"))
+    for shard in shards:
+        with safe_open(shard, framework="pt", device="cpu") as reader:
+            for key in reader.keys():
+                if key.startswith(wanted):
+                    return True
+    return False
+
+
+def require_front_draft_head(model_dir: str) -> None:
+    root = Path(model_dir)
+    has_norm = False
+    has_head = False
+    try:
+        from safetensors import safe_open
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "safetensors is required to inspect front draft-head weights."
+        ) from exc
+
+    for shard in sorted(root.glob("*.safetensors")):
+        with safe_open(shard, framework="pt", device="cpu") as reader:
+            keys = set(reader.keys())
+            has_norm = has_norm or any(k.startswith("model.norm.") for k in keys)
+            has_head = has_head or any(k.startswith("lm_head.") for k in keys)
+
+    if not has_norm or not has_head:
+        missing = []
+        if not has_norm:
+            missing.append("model.norm.*")
+        if not has_head:
+            missing.append("lm_head.*")
+        raise ValueError(
+            "self-speculative decoding requires front draft-head weights "
+            f"({', '.join(missing)} missing). Re-split with "
+            "`python3 -m split.ckpt ... --front_draft_head`."
+        )
+
+
+def attach_front_draft_head(model) -> None:
+    try:
+        model._splitllm_draft_norm = model.model.norm
+        model._splitllm_draft_lm_head = model.lm_head
+    except Exception as exc:
+        raise ValueError(
+            "front model does not expose model.norm/lm_head for draft logits"
+        ) from exc
+
+
 def load_front_model(
     front_dir: str,
     device: torch.device,
     dtype: torch.dtype,
     quant_mode: str = "none",
+    draft_head: bool = False,
 ):
     mode = normalize_quant_mode(quant_mode)
     if mode == "bnb_8bit":
+        if draft_head:
+            require_front_draft_head(front_dir)
         m = _load_bnb_8bit_model(front_dir, device, dtype)
+        if draft_head:
+            attach_front_draft_head(m)
         try:
             m.model.norm = nn.Identity()
             m.lm_head = nn.Identity()
@@ -119,15 +185,20 @@ def load_front_model(
         m.eval()
         return m
 
+    if draft_head:
+        require_front_draft_head(front_dir)
+
     cfg = AutoConfig.from_pretrained(front_dir)
     with init_empty_weights():
         m = AutoModelForCausalLM.from_config(cfg)
 
-    try:
-        m.model.norm = nn.Identity()
-        m.lm_head = nn.Identity()
-    except Exception:
-        pass
+    load_draft_modules = draft_head or checkpoint_has_draft_head(front_dir)
+    if not load_draft_modules:
+        try:
+            m.model.norm = nn.Identity()
+            m.lm_head = nn.Identity()
+        except Exception:
+            pass
 
     m = load_checkpoint_and_dispatch(
         m,
@@ -136,6 +207,13 @@ def load_front_model(
         offload_folder=None,
         dtype=dtype,
     )
+    if draft_head:
+        attach_front_draft_head(m)
+    try:
+        m.model.norm = nn.Identity()
+        m.lm_head = nn.Identity()
+    except Exception:
+        pass
     m.eval()
     return m
 
@@ -186,6 +264,8 @@ class SamplingConfig:
     no_repeat_ngram_size: int = 0
     repetition_penalty: float = 1.0
     bad_words_ids: Optional[list[list[int]]] = None
+    assistant_early_exit: Optional[int] = None
+    num_speculations: int = 3
 
     def validate(self) -> None:
         if self.temperature <= 0:
@@ -207,6 +287,21 @@ class SamplingConfig:
             raise ValueError(
                 f"repetition_penalty must be > 0, got {self.repetition_penalty}"
             )
+        if self.assistant_early_exit is not None:
+            if self.assistant_early_exit <= 0:
+                raise ValueError(
+                    "assistant_early_exit must be > 0 when self-speculative "
+                    f"decoding is enabled, got {self.assistant_early_exit}"
+                )
+            if self.num_speculations <= 0:
+                raise ValueError(
+                    f"num_speculations must be > 0, got {self.num_speculations}"
+                )
+            if self.do_sample:
+                raise ValueError(
+                    "self-speculative decoding currently supports greedy decoding only "
+                    "(do_sample=False)"
+                )
 
 
 @dataclass
@@ -228,6 +323,11 @@ class RuntimeGenerateResult:
     decode_codec_encode_ms: list[float] = field(default_factory=list)
     decode_codec_decode_ms: list[float] = field(default_factory=list)
     decode_codec_wire_bytes: list[int] = field(default_factory=list)
+    self_speculative: bool = False
+    draft_tokens: int = 0
+    accepted_tokens: int = 0
+    verify_rounds: int = 0
+    fallback_tokens: int = 0
     total_ms: float = 0.0
 
 
@@ -319,16 +419,25 @@ def encoded_to_payload(codec: ActivationCodec, encoded: EncodedActivation) -> di
     return payload
 
 
+def encoded_payload_size_bytes(codec: ActivationCodec, encoded: EncodedActivation) -> int:
+    payload = encoded_to_payload(codec, encoded)
+    wire_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return len(wire_json.encode("utf-8"))
+
+
 __all__ = [
     "SamplingConfig",
     "RuntimeGenerateResult",
     "pick_device_and_dtype",
     "resolve_dir",
     "normalize_quant_mode",
+    "checkpoint_has_draft_head",
+    "require_front_draft_head",
     "load_front_model",
     "load_back_model",
     "build_logits_processors",
     "build_logits_warpers",
     "select_next_token",
     "encoded_to_payload",
+    "encoded_payload_size_bytes",
 ]

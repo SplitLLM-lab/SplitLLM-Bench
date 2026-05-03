@@ -87,6 +87,7 @@ class SplitLLMModel:
         timeout_sec: float = 120.0,
         revision: str | None = None,
         codec: ActivationCodec | None = None,
+        enable_self_speculative: bool = False,
     ) -> "SplitLLMModel":
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, use_fast=True)
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
@@ -104,6 +105,7 @@ class SplitLLMModel:
                 back_quant=back_quant,
                 revision=revision,
                 codec=codec,
+                enable_self_speculative=bool(enable_self_speculative),
             )
         elif mode == "remote_back":
             if not front_dir or not server_url:
@@ -117,6 +119,7 @@ class SplitLLMModel:
                 timeout_sec=timeout_sec,
                 revision=revision,
                 codec=codec,
+                enable_self_speculative=bool(enable_self_speculative),
             )
         else:
             raise ValueError(
@@ -154,6 +157,8 @@ class SplitLLMModel:
         bad_words_ids: Optional[list[list[int]]] = None,
         stop_token_ids: Optional[Sequence[int]] = None,
         codec_extras: Optional[dict[str, Any]] = None,
+        assistant_early_exit: Optional[int] = None,
+        num_speculations: int = 3,
         use_chat_template: bool = True,
         add_generation_prompt: bool = True,
         skip_special_tokens: bool = True,
@@ -186,6 +191,8 @@ class SplitLLMModel:
             no_repeat_ngram_size=no_repeat_ngram_size,
             repetition_penalty=repetition_penalty,
             bad_words_ids=bad_words_ids,
+            assistant_early_exit=assistant_early_exit,
+            num_speculations=int(num_speculations),
         )
 
         eos_token_id = (
@@ -229,6 +236,11 @@ class SplitLLMModel:
             "server_ms": runtime_result.server_ms,
             "total_ms": runtime_result.total_ms,
             "tokens_generated": len(generated),
+            "self_speculative": runtime_result.self_speculative,
+            "draft_tokens": runtime_result.draft_tokens,
+            "accepted_tokens": runtime_result.accepted_tokens,
+            "verify_rounds": runtime_result.verify_rounds,
+            "fallback_tokens": runtime_result.fallback_tokens,
         }
 
         return GenerateResult(

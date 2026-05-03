@@ -45,6 +45,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt", type=str, default="Explain split inference in two sentences.")
     p.add_argument("--prompt_file", type=str, default=None)
     p.add_argument("--max_new_tokens", type=int, default=128)
+    p.add_argument(
+        "--generation_mode",
+        type=str,
+        default="autoregressive",
+        choices=["autoregressive", "self_speculative"],
+    )
+    p.add_argument("--assistant_early_exit", type=int, default=None)
+    p.add_argument("--num_speculations", type=int, default=3)
     p.add_argument("--do_sample", action="store_true")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=0)
@@ -71,6 +79,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     codec = build_codec(args.codec)
     codec_extras = parse_codec_extras(args.codec_extras_json)
     prompt = resolve_prompt(args.prompt, args.prompt_file)
+    if str(args.generation_mode) == "self_speculative" and args.assistant_early_exit is None:
+        raise ValueError(
+            "self_speculative generation requires --assistant_early_exit "
+            "(for LayerSkip Llama3 8B, try 4)"
+        )
 
     print("[info] building remote client model")
     model = SplitLLMModel.from_pretrained(
@@ -84,6 +97,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         timeout_sec=float(args.timeout_sec),
         revision=args.revision,
         codec=codec,
+        enable_self_speculative=str(args.generation_mode) == "self_speculative",
     )
 
     print(
@@ -101,6 +115,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         no_repeat_ngram_size=int(args.no_repeat_ngram_size),
         repetition_penalty=float(args.repetition_penalty),
         codec_extras=codec_extras,
+        assistant_early_exit=(
+            int(args.assistant_early_exit)
+            if str(args.generation_mode) == "self_speculative"
+            else None
+        ),
+        num_speculations=int(args.num_speculations),
         use_chat_template=not bool(args.no_chat_template),
         add_generation_prompt=not bool(args.no_generation_prompt),
     )

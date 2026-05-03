@@ -63,6 +63,26 @@ res = m.generate(prompt="Briefly compare TTFT and token RTT.", max_new_tokens=64
 print(res.text)
 ```
 
+Self-speculative generation uses the same API after loading the front with
+draft-head weights:
+
+```python
+m = SplitLLMModel.from_pretrained(
+    mode="remote_back",
+    tokenizer_id="facebook/layerskip-llama3-8B",
+    front_dir="./split_out_layerskip/front",
+    server_url="http://127.0.0.1:8000",
+    enable_self_speculative=True,
+)
+
+res = m.generate(
+    prompt="Explain LayerSkip briefly.",
+    max_new_tokens=64,
+    assistant_early_exit=4,
+    num_speculations=3,
+)
+```
+
 Run remote client generation (CLI):
 
 ```bash
@@ -83,3 +103,4 @@ python3 -m runtime.client \
 - Quant modes are `none` and `bnb_8bit` (aliases: `hf_int8`, `int8`, `bnb`).
 - `bnb_8bit` requires CUDA + `bitsandbytes`.
 - Local split runtime class is `runtime.local.LocalSplitRuntime` (no dedicated CLI entrypoint).
+- Self-speculative mode is greedy-only in this prototype and requires a front checkpoint split with `--front_draft_head`.

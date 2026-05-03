@@ -62,6 +62,21 @@ python3 -m bench.latency \
   --codec default
 ```
 
+Latency with self-speculative decoding:
+
+```bash
+python3 -m bench.latency \
+  --runtime_mode local_split \
+  --front_dir ./split_out_layerskip/front \
+  --back_dir ./split_out_layerskip/back \
+  --tokenizer_id facebook/layerskip-llama3-8B \
+  --generation_mode self_speculative \
+  --assistant_early_exit 4 \
+  --num_speculations 3 \
+  --max_new_tokens 64 \
+  --codec default
+```
+
 MMLU (local split, single-letter answer over A/B/C/D):
 
 ```bash
@@ -164,6 +179,7 @@ python3 -m bench.generate_jsonl \
 - `--codec` supports builtin codecs (`default`, `identity_fp32`).
 - `--codec` custom module forms: `custom.my_codec`, `custom.my_codec:build_codec`, `custom.registry.my_codec`.
 - `ppl.py` and `mmlu.py` are local-only; `latency.py` supports `local_split` and `remote_back`.
+- Self-speculative decoding is exposed in `latency.py` with `--generation_mode self_speculative`; the front checkpoint must be created with `split.ckpt --front_draft_head`.
 - `scenario.py` is local-only in v1. It measures local split compute and codec transfer bytes, then simulates the configured network post-hoc without sleeping.
 - `scenario.py` writes `scenario_result.json`, `timeline.csv`, and `timeline.png` under `--out_dir`.
 - Scenario prompt columns are auto-detected from `prompt`, `question`, `text`, `input`, or `query`; set `workload.prompt_column` when needed.

@@ -75,6 +75,23 @@ class DecodeRequest(BaseModel):
     codec_extras: dict[str, Any] = Field(default_factory=dict)
 
 
+class SpecVerifyRequest(BaseModel):
+    session_id: str
+    hidden: HiddenPayload
+    candidate_token_ids: list[int]
+    token_step: int = 0
+    codec_extras: dict[str, Any] = Field(default_factory=dict)
+
+
+class SpecCommitRequest(BaseModel):
+    session_id: str
+    hidden_last: HiddenPayload
+    token_id: int
+    seq_len: int
+    token_step: int = 0
+    codec_extras: dict[str, Any] = Field(default_factory=dict)
+
+
 class ResetRequest(BaseModel):
     session_id: str
 
@@ -87,11 +104,39 @@ class TokenResponse(BaseModel):
     codec_decode_ms: float = 0.0
 
 
+class SpecPrefillResponse(BaseModel):
+    session_id: str
+    seq_len: int
+    server_ms: float
+    codec_decode_ms: float = 0.0
+
+
+class SpecVerifyResponse(BaseModel):
+    session_id: str
+    accepted_token_ids: list[int]
+    fallback_token_id: Optional[int] = None
+    seq_len: int
+    server_ms: float
+    codec_decode_ms: float = 0.0
+
+
 @dataclass
 class SessionState:
     past_key_values: Any
     seq_len: int
     token_ids: torch.Tensor
+    processors: Any
+    warpers: Any
+    do_sample: bool
+    last_touch: float
+
+
+@dataclass
+class SpecSessionState:
+    past_key_values: Any
+    seq_len: int
+    token_ids: torch.Tensor
+    next_logits: torch.Tensor
     processors: Any
     warpers: Any
     do_sample: bool
@@ -115,6 +160,7 @@ class RemoteBackServer:
         self.back_dir = resolve_dir(back_dir, revision=revision)
         self.session_ttl_sec = session_ttl_sec
         self.sessions: dict[str, SessionState] = {}
+        self.spec_sessions: dict[str, SpecSessionState] = {}
 
         print(
             f"[info] loading remote back={self.back_dir} "
@@ -141,6 +187,17 @@ class RemoteBackServer:
         ]
         for sid in dead:
             self.sessions.pop(sid, None)
+            try:
+                self.codec.end_session(sid)
+            except Exception:
+                pass
+        dead_spec = [
+            sid
+            for sid, st in self.spec_sessions.items()
+            if now - st.last_touch > self.session_ttl_sec
+        ]
+        for sid in dead_spec:
+            self.spec_sessions.pop(sid, None)
             try:
                 self.codec.end_session(sid)
             except Exception:
@@ -178,12 +235,13 @@ class RemoteBackServer:
                 "ok": True,
                 "device": str(self.device),
                 "dtype": str(self.dtype),
-                "sessions": len(self.sessions),
+                "sessions": len(self.sessions) + len(self.spec_sessions),
             }
 
         @app.post("/reset")
         def reset(req: ResetRequest) -> dict[str, bool]:
             self.sessions.pop(req.session_id, None)
+            self.spec_sessions.pop(req.session_id, None)
             try:
                 self.codec.end_session(req.session_id)
             except Exception:
@@ -395,6 +453,331 @@ class RemoteBackServer:
             return TokenResponse(
                 session_id=req.session_id,
                 next_token_id=next_token_id,
+                seq_len=st.seq_len,
+                server_ms=(t1 - t0) * 1000.0,
+                codec_decode_ms=codec_decode_ms,
+            )
+
+        @app.post("/spec_prefill", response_model=SpecPrefillResponse)
+        @torch.no_grad()
+        def spec_prefill(req: PrefillRequest) -> SpecPrefillResponse:
+            self._cleanup_sessions()
+            sid = req.session_id or str(uuid.uuid4())
+            self.sessions.pop(sid, None)
+            old_spec = self.spec_sessions.pop(sid, None)
+            if old_spec is not None:
+                try:
+                    self.codec.end_session(sid)
+                except Exception:
+                    pass
+            self.codec.start_session(sid)
+            session_registered = False
+            try:
+                prefill_ctx = CodecContext(
+                    phase="prefill",
+                    side="cloud_self_spec",
+                    session_id=sid,
+                    seq_len=len(req.prompt_token_ids),
+                    step=0,
+                    extras=dict(req.codec_extras or {}),
+                )
+                t_codec0 = time.perf_counter()
+                hidden = self._payload_to_hidden(req.hidden, context=prefill_ctx)
+                codec_decode_ms = (time.perf_counter() - t_codec0) * 1000.0
+                if hidden.ndim != 3:
+                    raise HTTPException(status_code=400, detail="hidden must be [B, T, H]")
+
+                seq = int(hidden.shape[1])
+                if len(req.attention_mask) != seq:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "attention_mask length mismatch: "
+                            f"got {len(req.attention_mask)} expected {seq}"
+                        ),
+                    )
+                if len(req.prompt_token_ids) != seq:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "prompt_token_ids length mismatch: "
+                            f"got {len(req.prompt_token_ids)} expected {seq}"
+                        ),
+                    )
+
+                sampling = req.generation.to_sampling_config()
+                try:
+                    sampling.validate()
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                if sampling.do_sample:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="self-speculative remote mode supports greedy decoding only",
+                    )
+
+                processors = build_logits_processors(
+                    prompt_length=seq,
+                    eos_token_id=req.generation.eos_token_id,
+                    cfg=sampling,
+                )
+                warpers = build_logits_warpers(sampling)
+
+                attention_mask = torch.tensor(
+                    [req.attention_mask], device=self.device, dtype=torch.long
+                )
+                cache_position = torch.arange(0, seq, device=self.device)
+
+                t0 = time.perf_counter()
+                out = self.back.model(
+                    inputs_embeds=hidden,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                next_logits = self.back.lm_head(out.last_hidden_state)[:, -1, :]
+
+                token_ids = torch.tensor(
+                    [req.prompt_token_ids],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                self.spec_sessions[sid] = SpecSessionState(
+                    past_key_values=out.past_key_values,
+                    seq_len=seq,
+                    token_ids=token_ids,
+                    next_logits=next_logits,
+                    processors=processors,
+                    warpers=warpers,
+                    do_sample=sampling.do_sample,
+                    last_touch=time.time(),
+                )
+                session_registered = True
+
+                t1 = time.perf_counter()
+                return SpecPrefillResponse(
+                    session_id=sid,
+                    seq_len=seq,
+                    server_ms=(t1 - t0) * 1000.0,
+                    codec_decode_ms=codec_decode_ms,
+                )
+            except HTTPException:
+                if not session_registered:
+                    try:
+                        self.codec.end_session(sid)
+                    except Exception:
+                        pass
+                raise
+            except Exception as exc:
+                if not session_registered:
+                    try:
+                        self.codec.end_session(sid)
+                    except Exception:
+                        pass
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"codec/server spec prefill failed: {exc}",
+                ) from exc
+
+        @app.post("/spec_verify", response_model=SpecVerifyResponse)
+        @torch.no_grad()
+        def spec_verify(req: SpecVerifyRequest) -> SpecVerifyResponse:
+            self._cleanup_sessions()
+            st = self.spec_sessions.get(req.session_id)
+            if st is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="unknown session_id; call /spec_prefill first",
+                )
+            if not req.candidate_token_ids:
+                raise HTTPException(status_code=400, detail="candidate_token_ids is empty")
+
+            t0 = time.perf_counter()
+            first_target = select_next_token(
+                input_ids=st.token_ids,
+                logits=st.next_logits,
+                processors=st.processors,
+                warpers=st.warpers,
+                do_sample=st.do_sample,
+            )
+            if int(first_target.item()) != int(req.candidate_token_ids[0]):
+                st.last_touch = time.time()
+                t1 = time.perf_counter()
+                return SpecVerifyResponse(
+                    session_id=req.session_id,
+                    accepted_token_ids=[],
+                    fallback_token_id=int(first_target.item()),
+                    seq_len=st.seq_len,
+                    server_ms=(t1 - t0) * 1000.0,
+                    codec_decode_ms=0.0,
+                )
+
+            verify_ctx = CodecContext(
+                phase="decode",
+                side="cloud_self_spec",
+                session_id=req.session_id,
+                seq_len=st.seq_len + len(req.candidate_token_ids),
+                step=req.token_step,
+                extras=dict(req.codec_extras or {}),
+            )
+            try:
+                t_codec0 = time.perf_counter()
+                hidden = self._payload_to_hidden(req.hidden, context=verify_ctx)
+                codec_decode_ms = (time.perf_counter() - t_codec0) * 1000.0
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"codec decode failed at spec verify: {exc}",
+                ) from exc
+            if hidden.ndim != 3 or hidden.shape[1] != len(req.candidate_token_ids):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "hidden must be [B, K, H] and match candidate_token_ids length"
+                    ),
+                )
+
+            candidate_ids = torch.tensor(
+                [req.candidate_token_ids],
+                device=self.device,
+                dtype=torch.long,
+            )
+            cache_position = torch.arange(
+                st.seq_len,
+                st.seq_len + len(req.candidate_token_ids),
+                device=self.device,
+                dtype=torch.long,
+            )
+            attention_mask = torch.ones(
+                (1, st.seq_len + len(req.candidate_token_ids)),
+                device=self.device,
+                dtype=torch.long,
+            )
+
+            out = self.back.model(
+                inputs_embeds=hidden,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=st.past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            logits = self.back.lm_head(out.last_hidden_state)
+
+            accepted = 1
+            fallback_token_id: int | None = None
+            for idx in range(1, len(req.candidate_token_ids)):
+                context_ids = torch.cat([st.token_ids, candidate_ids[:, :idx]], dim=1)
+                target_token = select_next_token(
+                    input_ids=context_ids,
+                    logits=logits[:, idx - 1, :],
+                    processors=st.processors,
+                    warpers=st.warpers,
+                    do_sample=st.do_sample,
+                )
+                if int(target_token.item()) == int(req.candidate_token_ids[idx]):
+                    accepted += 1
+                else:
+                    fallback_token_id = int(target_token.item())
+                    break
+
+            st.past_key_values = out.past_key_values
+            if accepted < len(req.candidate_token_ids):
+                st.past_key_values.crop(st.seq_len + accepted)
+            st.seq_len += accepted
+            accepted_ids = req.candidate_token_ids[:accepted]
+            st.token_ids = torch.cat(
+                [
+                    st.token_ids,
+                    torch.tensor([accepted_ids], device=self.device, dtype=torch.long),
+                ],
+                dim=1,
+            )
+            st.next_logits = logits[:, accepted - 1, :]
+            st.last_touch = time.time()
+
+            t1 = time.perf_counter()
+            return SpecVerifyResponse(
+                session_id=req.session_id,
+                accepted_token_ids=accepted_ids,
+                fallback_token_id=fallback_token_id,
+                seq_len=st.seq_len,
+                server_ms=(t1 - t0) * 1000.0,
+                codec_decode_ms=codec_decode_ms,
+            )
+
+        @app.post("/spec_commit", response_model=SpecPrefillResponse)
+        @torch.no_grad()
+        def spec_commit(req: SpecCommitRequest) -> SpecPrefillResponse:
+            self._cleanup_sessions()
+            st = self.spec_sessions.get(req.session_id)
+            if st is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="unknown session_id; call /spec_prefill first",
+                )
+            expected = st.seq_len + 1
+            if req.seq_len != expected:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"seq_len mismatch: got {req.seq_len}, expected {expected}",
+                )
+
+            commit_ctx = CodecContext(
+                phase="decode",
+                side="cloud_self_spec",
+                session_id=req.session_id,
+                seq_len=req.seq_len,
+                step=req.token_step,
+                extras=dict(req.codec_extras or {}),
+            )
+            try:
+                t_codec0 = time.perf_counter()
+                hidden_last = self._payload_to_hidden(req.hidden_last, context=commit_ctx)
+                codec_decode_ms = (time.perf_counter() - t_codec0) * 1000.0
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"codec decode failed at spec commit: {exc}",
+                ) from exc
+            if hidden_last.ndim != 3 or hidden_last.shape[1] != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="hidden_last must be [B, 1, H]",
+                )
+
+            attention_mask = torch.ones(
+                (1, req.seq_len),
+                device=self.device,
+                dtype=torch.long,
+            )
+            cache_position = torch.tensor([st.seq_len], device=self.device)
+
+            t0 = time.perf_counter()
+            out = self.back.model(
+                inputs_embeds=hidden_last,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=st.past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            st.past_key_values = out.past_key_values
+            st.seq_len = req.seq_len
+            st.token_ids = torch.cat(
+                [
+                    st.token_ids,
+                    torch.tensor([[int(req.token_id)]], device=self.device, dtype=torch.long),
+                ],
+                dim=1,
+            )
+            st.next_logits = self.back.lm_head(out.last_hidden_state)[:, -1, :]
+            st.last_touch = time.time()
+
+            t1 = time.perf_counter()
+            return SpecPrefillResponse(
+                session_id=req.session_id,
                 seq_len=st.seq_len,
                 server_ms=(t1 - t0) * 1000.0,
                 codec_decode_ms=codec_decode_ms,

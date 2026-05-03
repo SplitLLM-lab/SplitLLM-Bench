@@ -93,6 +93,14 @@ def parse_args() -> argparse.Namespace:
         choices=["drop", "front", "back", "both"],
         help="How to route unmatched keys.",
     )
+    parser.add_argument(
+        "--front_draft_head",
+        action="store_true",
+        help=(
+            "Also copy model.norm.* and lm_head.* into the front checkpoint. "
+            "Required for edge/front self-speculative draft logits."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -192,10 +200,14 @@ def route_other_key(
 def ensure_back_lm_head_weight(
     front_sd: dict[str, Any],
     back_sd: dict[str, Any],
+    *,
+    front_draft_head: bool = False,
 ) -> bool:
     head_key = "lm_head.weight"
     embed_key = "model.embed_tokens.weight"
     if head_key in back_sd:
+        if front_draft_head and head_key not in front_sd:
+            front_sd[head_key] = back_sd[head_key].clone()
         return False
     if embed_key not in front_sd:
         raise KeyError(
@@ -203,6 +215,8 @@ def ensure_back_lm_head_weight(
             "model.embed_tokens.weight was not routed to front split"
         )
     back_sd[head_key] = front_sd[embed_key].clone()
+    if front_draft_head:
+        front_sd[head_key] = front_sd[embed_key].clone()
     return True
 
 
@@ -211,6 +225,7 @@ def split_checkpoint(
     adapter: SplitAdapter,
     cut: int,
     keep_other: str,
+    front_draft_head: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str], SplitStats]:
     try:
         from safetensors import safe_open
@@ -236,9 +251,14 @@ def split_checkpoint(
                     continue
 
                 if key.startswith(adapter.back_prefixes):
+                    tensor = reader.get_tensor(key)
                     if key in back_sd:
                         raise ValueError(f"duplicate key in back checkpoint: {key}")
-                    back_sd[key] = reader.get_tensor(key)
+                    back_sd[key] = tensor
+                    if front_draft_head:
+                        if key in front_sd:
+                            raise ValueError(f"duplicate key in front checkpoint: {key}")
+                        front_sd[key] = tensor.clone()
                     continue
 
                 matched = match_layer_key(key, adapter)
@@ -266,7 +286,11 @@ def split_checkpoint(
                 tensor = reader.get_tensor(key) if keep_other != "drop" else None
                 route_other_key(key, tensor, keep_other, front_sd, back_sd, other_keys)
 
-    injected = ensure_back_lm_head_weight(front_sd, back_sd)
+    injected = ensure_back_lm_head_weight(
+        front_sd,
+        back_sd,
+        front_draft_head=front_draft_head,
+    )
     if injected:
         print(
             "[warn] lm_head.weight missing in source shards; copied from "
@@ -374,6 +398,7 @@ def main() -> int:
         adapter=adapter,
         cut=args.cut,
         keep_other=args.keep_other,
+        front_draft_head=bool(args.front_draft_head),
     )
 
     total_layers = infer_total_layers(config, stats.max_layer_index)
@@ -396,6 +421,7 @@ def main() -> int:
             "cut": args.cut,
             "adapter": adapter.name,
             "keep_other": args.keep_other,
+            "front_draft_head": bool(args.front_draft_head),
         },
         "layers": {
             "from_config": int(config.get("num_hidden_layers", 0) or 0),

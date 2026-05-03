@@ -37,9 +37,29 @@ res = m.generate(prompt="Explain split inference in two sentences.", max_new_tok
 print(res.text)
 ```
 
+Self-speculative local generation:
+
+```python
+m = SplitLLMModel.from_pretrained(
+    mode="local_split",
+    tokenizer_id="facebook/layerskip-llama3-8B",
+    front_dir="./split_out_layerskip/front",
+    back_dir="./split_out_layerskip/back",
+    enable_self_speculative=True,
+)
+
+res = m.generate(
+    prompt="Explain LayerSkip briefly.",
+    max_new_tokens=64,
+    assistant_early_exit=4,
+    num_speculations=3,
+)
+```
+
 ## Notes
 
 - Modes: `local_split` and `remote_back`.
+- Self-speculative mode is greedy-only and requires a front checkpoint created with `split.ckpt --front_draft_head`.
 - Default codec is `DefaultCodec` (local split avoids transport-style conversion by default).
 - You can pass custom codecs via `codec=...` (`ActivationCodec` or `FunctionalActivationCodec`).
 - Remote server/client setup and CLI examples are documented in `runtime/README.md`.
