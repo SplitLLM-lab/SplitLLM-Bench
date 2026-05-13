@@ -7,13 +7,15 @@ import json
 import math
 import random
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 import yaml
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
+from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 
 from model import LocalSplitRuntime, SamplingConfig
@@ -119,12 +121,38 @@ def parse_dataset_config(value: Any) -> str | None:
     return text
 
 
+def load_longbench_dataset(config: str | None, split: str):
+    if split != "test":
+        raise ValueError("THUDM/LongBench only provides split='test'")
+    if config is None:
+        raise ValueError("THUDM/LongBench requires workload.dataset.config")
+
+    zip_path = hf_hub_download(
+        repo_id="THUDM/LongBench",
+        filename="data.zip",
+        repo_type="dataset",
+    )
+    member = f"data/{config}.jsonl"
+    print(f"[info] loading LongBench data zip={zip_path} member={member}")
+    rows: list[dict[str, Any]] = []
+    with zipfile.ZipFile(zip_path) as zf:
+        if member not in zf.namelist():
+            raise ValueError(f"LongBench config {config!r} not found in data.zip")
+        with zf.open(member) as fin:
+            for line in fin:
+                rows.append(json.loads(line.decode("utf-8")))
+    print(f"[ok] loaded LongBench config={config} rows={len(rows)}")
+    return Dataset.from_list(rows)
+
+
 def load_hf_dataset(dataset_cfg: dict[str, Any]):
     name = dataset_cfg.get("name")
     if not name:
         raise ValueError("workload.dataset.name is required")
     split = str(dataset_cfg.get("split", "test"))
     config = parse_dataset_config(dataset_cfg.get("config"))
+    if str(name) == "THUDM/LongBench":
+        return load_longbench_dataset(config, split)
     if config is None:
         return load_dataset(str(name), split=split)
     return load_dataset(str(name), config, split=split)

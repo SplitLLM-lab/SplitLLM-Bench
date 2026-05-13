@@ -20,6 +20,10 @@ my_methods/
 scenarios/
 split_out_*
 bench_out/
+calib/
+data/
+runs/
+tools/
 
 # Distribution / packaging
 .Python
