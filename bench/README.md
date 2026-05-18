@@ -94,65 +94,10 @@ python3 -m bench.mmlu \
   --codec default
 ```
 
-Scenario benchmark (local split + post-hoc network simulation):
-
-```yaml
-scenario:
-  name: mobile_agent_typical_5g
-  description: "Mobile tool-using agent over typical 5G uplink"
-
-network:
-  uplink_mbps:
-    mean: 15
-    jitter: 0.25
-    min: 5
-    max: 30
-  downlink_mbps:
-    mean: 80
-    jitter: 0.20
-  rtt_ms:
-    mean: 55
-    jitter: 15
-    burst_probability: 0.03
-    burst_extra_ms:
-      min: 50
-      max: 250
-  packet_loss: 0.0
-  seed: 42
-
-workload:
-  type: agent
-  dataset:
-    name: wikitext
-    config: wikitext-2-raw-v1
-    split: test
-  prompt_tokens:
-    target: 256
-    tolerance: 64
-  max_new_tokens: 32
-  stop_at_eos: false
-  generation:
-    decoding: greedy
-    temperature: 0.0
-
-targets:
-  ttft_s: 3.0
-  e2e_s: 30.0
-  mean_itl_ms: 200
-  atat_s: 15.0
-```
+Scenario benchmark (local split + post-hoc network simulation)
 
 ```bash
-source ~/b2gan/.venv/bin/activate
-python3 -m bench.scenario \
-  --scenario ./bench/mobile_agent_typical_5g.yaml \
-  --front_dir ./split_out/front \
-  --back_dir ./split_out/back \
-  --tokenizer_id Qwen/Qwen3-1.7B \
-  --samples 16 \
-  --skip_ppl \
-  --skip_mmlu \
-  --out_dir ./bench_out/mobile_agent_typical_5g
+
 ```
 
 Direct JSONL generation (local split):

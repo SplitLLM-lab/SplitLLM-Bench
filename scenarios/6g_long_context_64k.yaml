@@ -1,0 +1,17 @@
+name: 6g_long_context_64k
+description: Future 6G-like uplink but extreme context, showing context scale can still matter.
+dataset: synthetic_6g_long_context
+
+task:
+  input_tokens: 65536
+  output_tokens: 256
+  action_tokens: 80
+
+network: 6g_edge
+codec: automix8
+model: llama3_8b_split
+
+experience:
+  ttft_s: 3.0
+  interaction_s: 12.0
+  complete_s: 28.0

@@ -1,0 +1,17 @@
+name: mobile_rag_8k
+description: Mobile RAG with long retrieved context and moderate 5G.
+dataset: synthetic_rag
+
+task:
+  input_tokens: 8192
+  output_tokens: 160
+  action_tokens: 48
+
+network: 5g_mid
+codec: automix8
+model: llama3_8b_split
+
+experience:
+  ttft_s: 2.5
+  interaction_s: 8.0
+  complete_s: 20.0

@@ -17,7 +17,6 @@ bench/results/
 viz_out/
 test.py
 my_methods/
-scenarios/
 split_out_*
 bench_out/
 calib/
